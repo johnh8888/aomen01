@@ -1,0 +1,53 @@
+name: 新澳门六合彩每日同步与预测
+
+on:
+  schedule:
+    - cron: '0 7 * * *'
+  workflow_dispatch:
+
+jobs:
+  update-predict:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 拉取代码仓库
+        uses: actions/checkout@v4
+
+      - name: 设置 Python 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: 缓存 SQLite 数据库
+        uses: actions/cache@v3
+        with:
+          path: newmacau_marksix.db
+          key: newmacau-db-cache
+          restore-keys: |
+            newmacau-db-cache
+
+      - name: 同步数据、回测并生成预测
+        run: |
+          if [ ! -f newmacau_marksix.db ]; then
+            echo "数据库不存在，执行首次引导..."
+            python newmacau_marksix.py bootstrap
+          else
+            echo "数据库已存在，执行增量同步..."
+            python newmacau_marksix.py sync --with-backtest
+          fi
+
+      - name: 显示预测推荐
+        run: python newmacau_marksix.py show
+
+      - name: 上传预测报告
+        uses: actions/upload-artifact@v4
+        with:
+          name: 新澳门预测报告
+          path: |
+            newmacau_marksix.db
+            prediction_output.txt
+        if: always()
+
+      - name: 保存摘要到工作流输出
+        run: |
+          python newmacau_marksix.py show > prediction_output.txt
+          cat prediction_output.txt >> $GITHUB_STEP_SUMMARY
