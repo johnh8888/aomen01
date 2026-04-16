@@ -25,12 +25,18 @@ jobs:
           restore-keys: |
             newmacau-db-cache
 
-      - name: 同步数据、回测并生成预测
+      - name: 首次引导（如果数据库为空）
         run: |
           if [ ! -f newmacau_marksix.db ]; then
-            echo "数据库不存在，执行首次引导..."
+            echo "数据库不存在，开始从 API 引导..."
             python newmacau_marksix.py bootstrap
-          else
+            echo "首次引导完成，开始全量历史回测..."
+            python newmacau_marksix.py backtest --rebuild
+          fi
+
+      - name: 增量同步、回测并生成预测
+        run: |
+          if [ -f newmacau_marksix.db ]; then
             echo "数据库已存在，执行增量同步..."
             python newmacau_marksix.py sync --with-backtest
           fi
