@@ -1379,6 +1379,12 @@ def print_recommendation_sheet(conn: sqlite3.Connection, limit: int = 8) -> None
 
 
 def get_final_recommendation(conn: sqlite3.Connection) -> Optional[Tuple[str, List[int], int, List[int], List[int], List[int]]]:
+    """
+    获取最终推荐组合：
+    - 主号6码：来自策略 'cold_rebound_v1' (冷号回补) 的6号池
+    - 特别号：来自策略 'momentum_v1' (近期动量) 的特别号
+    - 10/14/20池：来自 'cold_rebound_v1' 的对应池
+    """
     row = conn.execute(
         "SELECT issue_no FROM prediction_runs WHERE status='PENDING' ORDER BY created_at DESC LIMIT 1"
     ).fetchone()
@@ -1386,18 +1392,20 @@ def get_final_recommendation(conn: sqlite3.Connection) -> Optional[Tuple[str, Li
         return None
     issue_no = row["issue_no"]
 
-    hot_run = conn.execute(
-        "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = 'hot_v1' AND status='PENDING'",
+    # 冷号回补策略作为主号来源
+    cold_run = conn.execute(
+        "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = 'cold_rebound_v1' AND status='PENDING'",
         (issue_no,)
     ).fetchone()
-    if not hot_run:
+    if not cold_run:
         return None
-    hot_id = hot_run["id"]
-    main6 = get_pool_numbers_for_run(conn, hot_id, 6)
-    pool10 = get_pool_numbers_for_run(conn, hot_id, 10)
-    pool14 = get_pool_numbers_for_run(conn, hot_id, 14)
-    pool20 = get_pool_numbers_for_run(conn, hot_id, 20)
+    cold_id = cold_run["id"]
+    main6 = get_pool_numbers_for_run(conn, cold_id, 6)
+    pool10 = get_pool_numbers_for_run(conn, cold_id, 10)
+    pool14 = get_pool_numbers_for_run(conn, cold_id, 14)
+    pool20 = get_pool_numbers_for_run(conn, cold_id, 20)
 
+    # 近期动量策略作为特别号来源
     mom_run = conn.execute(
         "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = 'momentum_v1' AND status='PENDING'",
         (issue_no,)
@@ -1425,7 +1433,7 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     p20 = " ".join(_fmt_num(n) for n in pool20)
     print("\n" + "=" * 50)
     print(f"【最终推荐 - 期号 {issue_no}】")
-    print(f"策略说明: 主号采用「热号策略」(基于最近8期数据)，特别号采用「近期动量」(基于最近8期数据)")
+    print(f"策略说明: 主号采用「冷号回补」(基于最近8期数据)，特别号采用「近期动量」(基于最近8期数据)")
     print(f"  6号池 : {p6} | 特别号: {special_text}")
     print(f"  10号池: {p10} | 特别号: {special_text}")
     print(f"  14号池: {p14} | 特别号: {special_text}")
