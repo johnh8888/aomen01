@@ -15,11 +15,11 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from urllib.request import Request, urlopen
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DB_PATH_DEFAULT = str(SCRIPT_DIR / "newmacau_marksix.db")
-CSV_PATH_DEFAULT = str(SCRIPT_DIR / "NewMacau_Mark_Six.csv")
+DB_PATH_DEFAULT = str(SCRIPT_DIR / "macau_marksix.db")
+CSV_PATH_DEFAULT = str(SCRIPT_DIR / "Macau_Mark_Six.csv")
 
-# 新澳门数据源（使用 marksix6.net API）
-NEWMACAU_API_URL = "https://marksix6.net/index.php?api=1"
+# 澳门数据源（使用 marksix6.net API 中的“新澳门彩”）
+MACAU_API_URL = "https://marksix6.net/index.php?api=1"
 
 MINED_CONFIG_KEY = "mined_strategy_config_v1"
 ALL_NUMBERS = list(range(1, 50))
@@ -322,25 +322,22 @@ def _to_int(value: object) -> Optional[int]:
     return n if 1 <= n <= 49 else None
 
 
-def parse_newmacau_from_marksix6_api(payload: dict) -> List[DrawRecord]:
-    """
-    从 marksix6.net API 返回的 JSON 中提取新澳门彩（name="新澳门彩"）的数据。
-    """
+def parse_macau_from_marksix6_api(payload: dict) -> List[DrawRecord]:
     records: List[DrawRecord] = []
     lottery_list = payload.get("lottery_data", [])
     if not isinstance(lottery_list, list):
         return records
 
-    newmacau_data = None
+    macau_data = None
     for item in lottery_list:
         if isinstance(item, dict) and item.get("name") == "新澳门彩":
-            newmacau_data = item
+            macau_data = item
             break
 
-    if not newmacau_data:
+    if not macau_data:
         return records
 
-    history_list = newmacau_data.get("history", [])
+    history_list = macau_data.get("history", [])
     if history_list and isinstance(history_list, list):
         for line in history_list:
             match = re.match(r"(\d{7})\s*期[：:]\s*([\d,]+)", line)
@@ -361,8 +358,7 @@ def parse_newmacau_from_marksix6_api(payload: dict) -> List[DrawRecord]:
             else:
                 issue_no = expect_raw
 
-            # 由于 history 中无日期，使用主条目中的 openTime 日期（最新一期日期）
-            draw_date = _parse_date(newmacau_data.get("openTime", "").split()[0]) if newmacau_data.get("openTime") else None
+            draw_date = _parse_date(macau_data.get("openTime", "").split()[0]) if macau_data.get("openTime") else None
             if not draw_date:
                 draw_date = "2026-01-01"
             records.append(DrawRecord(
@@ -372,9 +368,8 @@ def parse_newmacau_from_marksix6_api(payload: dict) -> List[DrawRecord]:
                 special_number=special,
             ))
     else:
-        # 如果没有 history，则只使用当前期
-        expect_raw = str(newmacau_data.get("expect", ""))
-        numbers_raw = newmacau_data.get("openCode") or newmacau_data.get("numbers")
+        expect_raw = str(macau_data.get("expect", ""))
+        numbers_raw = macau_data.get("openCode") or macau_data.get("numbers")
         if numbers_raw:
             if isinstance(numbers_raw, str):
                 num_list = _parse_numbers(numbers_raw)
@@ -391,7 +386,7 @@ def parse_newmacau_from_marksix6_api(payload: dict) -> List[DrawRecord]:
                     issue_no = f"{year}/{seq.zfill(3)}"
                 else:
                     issue_no = expect_raw
-                draw_date = _parse_date(newmacau_data.get("openTime", "").split()[0]) if newmacau_data.get("openTime") else None
+                draw_date = _parse_date(macau_data.get("openTime", "").split()[0]) if macau_data.get("openTime") else None
                 if draw_date:
                     records.append(DrawRecord(
                         issue_no=issue_no,
@@ -406,20 +401,20 @@ def parse_newmacau_from_marksix6_api(payload: dict) -> List[DrawRecord]:
     return sorted(dedup.values(), key=lambda r: (r.draw_date, r.issue_no))
 
 
-def fetch_newmacau_records() -> List[DrawRecord]:
+def fetch_macau_records() -> List[DrawRecord]:
     req = Request(
-        NEWMACAU_API_URL,
+        MACAU_API_URL,
         headers={
-            "User-Agent": "Mozilla/5.0 (compatible; newmacau-local/1.0)",
+            "User-Agent": "Mozilla/5.0 (compatible; macau-local/1.0)",
             "Accept": "application/json",
         },
     )
     with urlopen(req, timeout=20) as resp:
         raw = resp.read().decode("utf-8-sig")
     payload = json.loads(raw)
-    records = parse_newmacau_from_marksix6_api(payload)
+    records = parse_macau_from_marksix6_api(payload)
     if not records:
-        raise RuntimeError("新澳门彩数据解析失败，请检查API返回格式")
+        raise RuntimeError("澳门彩数据解析失败，请检查API返回格式")
     return records
 
 
@@ -540,7 +535,7 @@ def missing_issues_since_latest(conn: sqlite3.Connection, incoming: List[DrawRec
     return missing
 
 
-def load_recent_draws(conn: sqlite3.Connection, limit: int = 120) -> List[List[int]]:
+def load_recent_draws(conn: sqlite3.Connection, limit: int = 8) -> List[List[int]]:
     rows = conn.execute(
         "SELECT numbers_json FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT ?",
         (limit,),
@@ -581,7 +576,7 @@ def _momentum_map(draws: List[List[int]]) -> Dict[int, float]:
     return m
 
 
-def _pair_affinity_map(draws: List[List[int]], window: int = 200) -> Dict[int, float]:
+def _pair_affinity_map(draws: List[List[int]], window: int = 8) -> Dict[int, float]:
     pair_count: Dict[Tuple[int, int], int] = {}
     for draw in draws[:window]:
         s = sorted(draw)
@@ -597,7 +592,7 @@ def _pair_affinity_map(draws: List[List[int]], window: int = 200) -> Dict[int, f
     return social
 
 
-def _zone_heat_map(draws: List[List[int]], window: int = 80) -> Dict[int, float]:
+def _zone_heat_map(draws: List[List[int]], window: int = 8) -> Dict[int, float]:
     zone_counts = [0.0] * 5
     w = draws[:window]
     if not w:
@@ -659,7 +654,7 @@ def _pick_top_six(scores: Dict[int, float], reason: str) -> List[Tuple[int, int,
 
 def _default_mined_config() -> Dict[str, float]:
     return {
-        "window": 80.0,
+        "window": 8.0,
         "w_freq": 0.40,
         "w_omit": 0.30,
         "w_mom": 0.20,
@@ -670,7 +665,7 @@ def _default_mined_config() -> Dict[str, float]:
 
 
 def _candidate_mined_configs() -> List[Dict[str, float]]:
-    windows = [40, 60, 80, 120, 160]
+    windows = [8]
     weight_triplets = [
         (0.50, 0.30, 0.20),
         (0.45, 0.35, 0.20),
@@ -711,13 +706,13 @@ def _apply_weight_config(
     config: Dict[str, float],
     reason: str,
 ) -> Tuple[List[Tuple[int, int, float, str]], int, float, Dict[int, float]]:
-    window_size = int(config.get("window", 80))
-    window = draws[: max(20, window_size)]
+    window_size = int(config.get("window", 8))
+    window = draws[: max(8, window_size)]
     freq = _normalize(_freq_map(window))
     omission = _normalize(_omission_map(window))
     momentum = _normalize(_momentum_map(window))
-    pair = _normalize(_pair_affinity_map(window, window=min(200, len(window))))
-    zone = _normalize(_zone_heat_map(window, window=min(80, len(window))))
+    pair = _normalize(_pair_affinity_map(window, window=min(8, len(window))))
+    zone = _normalize(_zone_heat_map(window, window=min(8, len(window))))
 
     w_freq = float(config.get("w_freq", 0.45))
     w_omit = float(config.get("w_omit", 0.35))
@@ -745,14 +740,14 @@ def _apply_weight_config(
 
 
 def mine_pattern_config_from_rows(rows: Sequence[sqlite3.Row]) -> Dict[str, float]:
-    if len(rows) < 120:
+    if len(rows) < 8:
         return _default_mined_config()
 
     candidates = _candidate_mined_configs()
     best_cfg = _default_mined_config()
     best_score = -1.0
 
-    min_history = 20
+    min_history = 8
     eval_span = min(500, len(rows) - min_history)
     start = max(min_history, len(rows) - eval_span)
 
@@ -861,12 +856,12 @@ def _ensemble_strategy(
     draws: List[List[int]],
     mined_cfg: Optional[Dict[str, float]],
 ) -> Tuple[List[Tuple[int, int, float, str]], int, float, Dict[int, float]]:
-    m_hot = _apply_weight_config(draws, {"window": 80.0, "w_freq": 0.8, "w_omit": 0.0, "w_mom": 0.2}, "热号策略")
-    m_cold = _apply_weight_config(draws, {"window": 80.0, "w_freq": 0.0, "w_omit": 0.7, "w_mom": 0.3}, "冷号回补")
-    m_mom = _apply_weight_config(draws, {"window": 80.0, "w_freq": 0.1, "w_omit": 0.0, "w_mom": 0.9}, "近期动量")
+    m_hot = _apply_weight_config(draws, {"window": 8.0, "w_freq": 0.8, "w_omit": 0.0, "w_mom": 0.2}, "热号策略")
+    m_cold = _apply_weight_config(draws, {"window": 8.0, "w_freq": 0.0, "w_omit": 0.7, "w_mom": 0.3}, "冷号回补")
+    m_mom = _apply_weight_config(draws, {"window": 8.0, "w_freq": 0.1, "w_omit": 0.0, "w_mom": 0.9}, "近期动量")
     m_bal = _apply_weight_config(
         draws,
-        {"window": 80.0, "w_freq": 0.4, "w_omit": 0.3, "w_mom": 0.2, "w_pair": 0.05, "w_zone": 0.05},
+        {"window": 8.0, "w_freq": 0.4, "w_omit": 0.3, "w_mom": 0.2, "w_pair": 0.05, "w_zone": 0.05},
         "组合策略",
     )
     m_mined = _apply_weight_config(draws, mined_cfg or _default_mined_config(), "规律挖掘")
@@ -889,11 +884,11 @@ def generate_strategy(
     mined_config: Optional[Dict[str, float]] = None,
 ) -> Tuple[List[Tuple[int, int, float, str]], int, float, Dict[int, float]]:
     if strategy == "hot_v1":
-        return _apply_weight_config(draws, {"window": 80.0, "w_freq": 0.8, "w_omit": 0.0, "w_mom": 0.2}, "热号策略")
+        return _apply_weight_config(draws, {"window": 8.0, "w_freq": 0.8, "w_omit": 0.0, "w_mom": 0.2}, "热号策略")
     if strategy == "cold_rebound_v1":
-        return _apply_weight_config(draws, {"window": 80.0, "w_freq": 0.0, "w_omit": 0.7, "w_mom": 0.3}, "冷号回补")
+        return _apply_weight_config(draws, {"window": 8.0, "w_freq": 0.0, "w_omit": 0.7, "w_mom": 0.3}, "冷号回补")
     if strategy == "momentum_v1":
-        return _apply_weight_config(draws, {"window": 80.0, "w_freq": 0.1, "w_omit": 0.0, "w_mom": 0.9}, "近期动量")
+        return _apply_weight_config(draws, {"window": 8.0, "w_freq": 0.1, "w_omit": 0.0, "w_mom": 0.9}, "近期动量")
     if strategy == "ensemble_v2":
         return _ensemble_strategy(draws, mined_config)
     if strategy == "pattern_mined_v1":
@@ -901,7 +896,7 @@ def generate_strategy(
         return _apply_weight_config(draws, cfg, "规律挖掘")
     return _apply_weight_config(
         draws,
-        {"window": 80.0, "w_freq": 0.40, "w_omit": 0.30, "w_mom": 0.20, "w_pair": 0.05, "w_zone": 0.05},
+        {"window": 8.0, "w_freq": 0.40, "w_omit": 0.30, "w_mom": 0.20, "w_pair": 0.05, "w_zone": 0.05},
         "组合策略",
     )
 
@@ -911,9 +906,9 @@ def generate_predictions(conn: sqlite3.Connection, issue_no: Optional[str] = Non
     if not row:
         raise RuntimeError("No draws found. Run sync/bootstrap first.")
     target_issue = issue_no or next_issue(row["issue_no"])
-    draws = load_recent_draws(conn, 200)
-    if len(draws) < 20:
-        raise RuntimeError("Need at least 20 draws to generate predictions.")
+    draws = load_recent_draws(conn, 8)
+    if len(draws) < 8:
+        raise RuntimeError("Need at least 8 draws to generate predictions.")
     mined_cfg = ensure_mined_pattern_config(conn, force=False)
 
     for strategy in STRATEGY_IDS:
@@ -971,13 +966,18 @@ def _draws_ordered_asc(conn: sqlite3.Connection) -> List[sqlite3.Row]:
 
 def run_historical_backtest(
     conn: sqlite3.Connection,
-    min_history: int = 20,
+    min_history: int = 8,
     rebuild: bool = False,
     progress_every: int = 20,
+    max_issues: int = 30,
 ) -> Tuple[int, int]:
     draws = _draws_ordered_asc(conn)
     if len(draws) <= min_history:
         return 0, 0
+
+    if max_issues > 0 and len(draws) > max_issues + min_history:
+        draws = draws[-(max_issues + min_history):]
+        print(f"[backtest] 限制回测范围为最近 {max_issues} 期（实际处理 {len(draws) - min_history} 期）", flush=True)
 
     if rebuild:
         conn.execute(
@@ -1019,14 +1019,16 @@ def run_historical_backtest(
         if existing and int(existing["c"]) >= len(STRATEGY_IDS):
             continue
 
-        history_desc = [json.loads(draws[j]["numbers_json"]) for j in range(i - 1, -1, -1)]
+        history_desc = [json.loads(draws[j]["numbers_json"]) for j in range(i - 1, max(-1, i - 9), -1)]
+        if len(history_desc) < min_history:
+            continue
         winning_main = set(json.loads(target["numbers_json"]))
         winning_special = int(target["special_number"])
 
         for strategy in STRATEGY_IDS:
             mined_cfg = None
             if strategy == "pattern_mined_v1":
-                bucket = i // 50
+                bucket = i // 8
                 if bucket not in mined_cfg_cache:
                     mined_cfg_cache[bucket] = mine_pattern_config_from_rows(draws[:i])
                 mined_cfg = mined_cfg_cache[bucket]
@@ -1298,8 +1300,8 @@ def get_picks_for_run(conn: sqlite3.Connection, run_id: int) -> Tuple[List[int],
 
 
 def backfill_missing_special_picks(conn: sqlite3.Connection) -> int:
-    draws = load_recent_draws(conn, 200)
-    if len(draws) < 20:
+    draws = load_recent_draws(conn, 8)
+    if len(draws) < 8:
         return 0
     mined_cfg = ensure_mined_pattern_config(conn, force=False)
 
@@ -1377,19 +1379,24 @@ def print_recommendation_sheet(conn: sqlite3.Connection, limit: int = 8) -> None
 
 
 def get_final_recommendation(conn: sqlite3.Connection) -> Optional[Tuple[str, List[int], int, List[int], List[int], List[int]]]:
-    """
-    获取最终推荐组合：
-    - 主号6码：来自策略 'momentum_v1' (近期动量) 的6号池
-    - 特别号：来自策略 'pattern_mined_v1' (规律挖掘) 的特别号
-    - 10/14/20池：来自 'momentum_v1' 的对应池
-    返回 (issue_no, main6, special, pool10, pool14, pool20) 或 None
-    """
     row = conn.execute(
         "SELECT issue_no FROM prediction_runs WHERE status='PENDING' ORDER BY created_at DESC LIMIT 1"
     ).fetchone()
     if not row:
         return None
     issue_no = row["issue_no"]
+
+    hot_run = conn.execute(
+        "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = 'hot_v1' AND status='PENDING'",
+        (issue_no,)
+    ).fetchone()
+    if not hot_run:
+        return None
+    hot_id = hot_run["id"]
+    main6 = get_pool_numbers_for_run(conn, hot_id, 6)
+    pool10 = get_pool_numbers_for_run(conn, hot_id, 10)
+    pool14 = get_pool_numbers_for_run(conn, hot_id, 14)
+    pool20 = get_pool_numbers_for_run(conn, hot_id, 20)
 
     mom_run = conn.execute(
         "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = 'momentum_v1' AND status='PENDING'",
@@ -1398,19 +1405,7 @@ def get_final_recommendation(conn: sqlite3.Connection) -> Optional[Tuple[str, Li
     if not mom_run:
         return None
     mom_id = mom_run["id"]
-    main6 = get_pool_numbers_for_run(conn, mom_id, 6)
-    pool10 = get_pool_numbers_for_run(conn, mom_id, 10)
-    pool14 = get_pool_numbers_for_run(conn, mom_id, 14)
-    pool20 = get_pool_numbers_for_run(conn, mom_id, 20)
-
-    pattern_run = conn.execute(
-        "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = 'pattern_mined_v1' AND status='PENDING'",
-        (issue_no,)
-    ).fetchone()
-    if not pattern_run:
-        return None
-    pattern_id = pattern_run["id"]
-    _, special = get_picks_for_run(conn, pattern_id)
+    _, special = get_picks_for_run(conn, mom_id)
     if special is None:
         return None
 
@@ -1430,7 +1425,7 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     p20 = " ".join(_fmt_num(n) for n in pool20)
     print("\n" + "=" * 50)
     print(f"【最终推荐 - 期号 {issue_no}】")
-    print(f"策略说明: 主号采用「近期动量」(历史平均命中0.75)，特别号采用「规律挖掘」(历史命中率3.42%)")
+    print(f"策略说明: 主号采用「热号策略」(基于最近8期数据)，特别号采用「近期动量」(基于最近8期数据)")
     print(f"  6号池 : {p6} | 特别号: {special_text}")
     print(f"  10号池: {p10} | 特别号: {special_text}")
     print(f"  14号池: {p14} | 特别号: {special_text}")
@@ -1468,10 +1463,10 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
     conn = connect_db(args.db)
     try:
         init_db(conn)
-        records = fetch_newmacau_records()
-        total, inserted, updated = sync_from_records(conn, records, source="newmacau_api")
-        print("自动执行全量历史回测...")
-        run_historical_backtest(conn, rebuild=True, progress_every=20)
+        records = fetch_macau_records()
+        total, inserted, updated = sync_from_records(conn, records, source="macau_api")
+        print("自动执行全量历史回测（8期窗口）...")
+        run_historical_backtest(conn, rebuild=True, max_issues=0)
         issue = generate_predictions(conn)
         print(f"Bootstrap done. total={total}, inserted={inserted}, updated={updated}, next_prediction={issue}")
     finally:
@@ -1482,19 +1477,19 @@ def cmd_sync(args: argparse.Namespace) -> None:
     conn = connect_db(args.db)
     try:
         init_db(conn)
-        records = fetch_newmacau_records()
+        records = fetch_macau_records()
         if args.require_continuity:
             missing = missing_issues_since_latest(conn, records)
             if missing:
                 raise RuntimeError(
                     f"Continuity check failed. Missing {len(missing)} issues, sample={','.join(missing[:10])}"
                 )
-        total, inserted, updated = sync_from_records(conn, records, source="newmacau_api")
+        total, inserted, updated = sync_from_records(conn, records, source="macau_api")
         mined_cfg = ensure_mined_pattern_config(conn, force=args.remine)
         reviewed = review_latest(conn)
         bt_issues, bt_runs = 0, 0
         if args.with_backtest:
-            bt_issues, bt_runs = run_historical_backtest(conn, rebuild=False)
+            bt_issues, bt_runs = run_historical_backtest(conn, rebuild=False, max_issues=30)
         issue = generate_predictions(conn)
         patched = backfill_missing_special_picks(conn)
         print(f"Sync done. total={total}, inserted={inserted}, updated={updated}, reviewed={reviewed}, next_prediction={issue}")
@@ -1550,6 +1545,7 @@ def cmd_backtest(args: argparse.Namespace) -> None:
             min_history=args.min_history,
             rebuild=args.rebuild,
             progress_every=args.progress_every,
+            max_issues=args.max_issues if hasattr(args, 'max_issues') else 30,
         )
         print(f"Backtest done. issues={issues}, strategy_runs={runs}, rebuild={args.rebuild}")
         print(f"Mined config: {json.dumps(mined_cfg, ensure_ascii=False)}")
@@ -1568,21 +1564,22 @@ def cmd_mine(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="新澳门六合彩预测工具 (Python + SQLite)")
+    p = argparse.ArgumentParser(description="澳门六合彩预测工具 - 基于最近8期数据")
     p.add_argument("--db", default=DB_PATH_DEFAULT, help=f"SQLite db path (default: {DB_PATH_DEFAULT})")
     p.add_argument("--update", action="store_true", help="Quick sync (same as sync)")
+    p.add_argument("--updata", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--update-csv", default=CSV_PATH_DEFAULT, help=f"CSV path used with --update (default: {CSV_PATH_DEFAULT})")
     p.add_argument("--remine", action="store_true", help="Re-mine pattern config before sync/backtest")
     p.add_argument("--require-continuity", action="store_true", default=True, help="Fail update when issue sequence has gaps")
     p.add_argument("--no-require-continuity", dest="require_continuity", action="store_false", help="Allow gaps")
-    p.add_argument("--with-backtest", action="store_true", help="Run incremental backtest after sync")
+    p.add_argument("--with-backtest", action="store_true", help="Run incremental backtest after sync (only last 30 issues)")
     sub = p.add_subparsers(dest="command", required=False)
 
     p_boot = sub.add_parser("bootstrap", help="Initial import from API and generate next issue predictions")
     p_boot.set_defaults(func=cmd_bootstrap)
 
     p_sync = sub.add_parser("sync", help="Sync draws from API, review latest, generate next prediction")
-    p_sync.add_argument("--with-backtest", action="store_true", help="Run incremental backtest after sync")
+    p_sync.add_argument("--with-backtest", action="store_true", help="Run incremental backtest after sync (only last 30 issues)")
     p_sync.set_defaults(func=cmd_sync)
 
     p_predict = sub.add_parser("predict", help="Generate predictions for next or specified issue")
@@ -1597,10 +1594,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_show.set_defaults(func=cmd_show)
 
     p_backtest = sub.add_parser("backtest", help="Run historical backtest for all draw issues")
-    p_backtest.add_argument("--min-history", type=int, default=20, help="Min history window before first backtest issue")
+    p_backtest.add_argument("--min-history", type=int, default=8, help="Min history window before first backtest issue")
     p_backtest.add_argument("--rebuild", action="store_true", help="Rebuild reviewed backtest runs from scratch")
     p_backtest.add_argument("--remine", action="store_true", help="Re-mine pattern config before backtest")
-    p_backtest.add_argument("--progress-every", type=int, default=50, help="Print backtest progress every N processed issues (0 to disable)")
+    p_backtest.add_argument("--max-issues", type=int, default=30, help="只回测最近 N 期（0=全部）")
+    p_backtest.add_argument("--progress-every", type=int, default=20, help="Print backtest progress every N processed issues (0 to disable)")
     p_backtest.set_defaults(func=cmd_backtest)
 
     p_mine = sub.add_parser("mine", help="Mine best pattern parameters from history")
