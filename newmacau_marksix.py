@@ -15,8 +15,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from urllib.request import Request, urlopen
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DB_PATH_DEFAULT = str(SCRIPT_DIR / "macau_marksix.db")
-CSV_PATH_DEFAULT = str(SCRIPT_DIR / "Macau_Mark_Six.csv")
+DB_PATH_DEFAULT = str(SCRIPT_DIR / "newmacau_marksix.db")
+CSV_PATH_DEFAULT = str(SCRIPT_DIR / "NewMacau_Mark_Six.csv")
 
 # 澳门数据源（使用 marksix6.net API 中的“新澳门彩”）
 MACAU_API_URL = "https://marksix6.net/index.php?api=1"
