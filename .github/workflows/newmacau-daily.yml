@@ -30,8 +30,6 @@ jobs:
           if [ ! -f newmacau_marksix.db ]; then
             echo "数据库不存在，开始从 API 引导..."
             python newmacau_marksix.py bootstrap
-            echo "首次引导完成，开始全量历史回测..."
-            python newmacau_marksix.py backtest --rebuild
           fi
 
       - name: 增量同步、回测并生成预测
