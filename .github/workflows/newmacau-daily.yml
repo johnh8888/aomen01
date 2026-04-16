@@ -20,38 +20,38 @@ jobs:
       - name: 缓存 SQLite 数据库
         uses: actions/cache@v3
         with:
-          path: macau_marksix.db
-          key: macau-db-cache
+          path: newmacau_marksix.db
+          key: newmacau-db-cache
           restore-keys: |
-            macau-db-cache
+            newmacau-db-cache
 
       - name: 首次引导（如果数据库为空）
         run: |
-          if [ ! -f macau_marksix.db ]; then
+          if [ ! -f newmacau_marksix.db ]; then
             echo "数据库不存在，开始从 API 引导（全量回测）..."
-            python macau_marksix.py bootstrap
+            python newmacau_marksix.py bootstrap
           fi
 
       - name: 日常同步（只回测最近30期）
         run: |
-          if [ -f macau_marksix.db ]; then
+          if [ -f newmacau_marksix.db ]; then
             echo "数据库已存在，执行日常同步（回测最近30期）..."
-            python macau_marksix.py sync --with-backtest
+            python newmacau_marksix.py sync --with-backtest
           fi
 
       - name: 显示预测推荐
-        run: python macau_marksix.py show
+        run: python newmacau_marksix.py show
 
       - name: 上传预测报告
         uses: actions/upload-artifact@v4
         with:
           name: 澳门预测报告
           path: |
-            macau_marksix.db
+            newmacau_marksix.db
             prediction_output.txt
         if: always()
 
       - name: 保存摘要到工作流输出
         run: |
-          python macau_marksix.py show > prediction_output.txt
+          python newmacau_marksix.py show > prediction_output.txt
           cat prediction_output.txt >> $GITHUB_STEP_SUMMARY
