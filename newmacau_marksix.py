@@ -1378,12 +1378,14 @@ def print_recommendation_sheet(conn: sqlite3.Connection, limit: int = 8) -> None
         print(f"    20号池: {p20} | 特别号: {special_text}")
 
 
-def get_final_recommendation(conn: sqlite3.Connection) -> Optional[Tuple[str, List[int], int, List[int], List[int], List[int]]]:
+def get_final_recommendation(conn: sqlite3.Connection) -> Optional[Tuple[str, List[int], int, int, List[int], List[int], List[int]]]:
     """
     获取最终推荐组合：
     - 主号6码：来自策略 'cold_rebound_v1' (冷号回补) 的6号池
-    - 特别号：来自策略 'momentum_v1' (近期动量) 的特别号
+    - 特别号候选1：来自策略 'momentum_v1' (近期动量) 的特别号
+    - 特别号候选2：来自策略 'pattern_mined_v1' (规律挖掘) 的特别号
     - 10/14/20池：来自 'cold_rebound_v1' 的对应池
+    返回 (issue_no, main6, special_momentum, special_pattern, pool10, pool14, pool20)
     """
     row = conn.execute(
         "SELECT issue_no FROM prediction_runs WHERE status='PENDING' ORDER BY created_at DESC LIMIT 1"
@@ -1405,19 +1407,28 @@ def get_final_recommendation(conn: sqlite3.Connection) -> Optional[Tuple[str, Li
     pool14 = get_pool_numbers_for_run(conn, cold_id, 14)
     pool20 = get_pool_numbers_for_run(conn, cold_id, 20)
 
-    # 近期动量策略作为特别号来源
+    # 近期动量策略的特别号
     mom_run = conn.execute(
         "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = 'momentum_v1' AND status='PENDING'",
         (issue_no,)
     ).fetchone()
-    if not mom_run:
-        return None
-    mom_id = mom_run["id"]
-    _, special = get_picks_for_run(conn, mom_id)
-    if special is None:
+    special_momentum = None
+    if mom_run:
+        _, special_momentum = get_picks_for_run(conn, mom_run["id"])
+
+    # 规律挖掘策略的特别号
+    pattern_run = conn.execute(
+        "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = 'pattern_mined_v1' AND status='PENDING'",
+        (issue_no,)
+    ).fetchone()
+    special_pattern = None
+    if pattern_run:
+        _, special_pattern = get_picks_for_run(conn, pattern_run["id"])
+
+    if special_momentum is None and special_pattern is None:
         return None
 
-    return (issue_no, main6, special, pool10, pool14, pool20)
+    return (issue_no, main6, special_momentum, special_pattern, pool10, pool14, pool20)
 
 
 def print_final_recommendation(conn: sqlite3.Connection) -> None:
@@ -1425,19 +1436,22 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     if not rec:
         print("\n最终推荐: (暂无有效预测)")
         return
-    issue_no, main6, special, pool10, pool14, pool20 = rec
-    special_text = _fmt_num(special)
+    issue_no, main6, special_mom, special_pattern, pool10, pool14, pool20 = rec
+    special_mom_text = _fmt_num(special_mom) if special_mom is not None else "--"
+    special_pattern_text = _fmt_num(special_pattern) if special_pattern is not None else "--"
     p6 = " ".join(_fmt_num(n) for n in main6)
     p10 = " ".join(_fmt_num(n) for n in pool10)
     p14 = " ".join(_fmt_num(n) for n in pool14)
     p20 = " ".join(_fmt_num(n) for n in pool20)
     print("\n" + "=" * 50)
     print(f"【最终推荐 - 期号 {issue_no}】")
-    print(f"策略说明: 主号采用「冷号回补」(基于最近8期数据)，特别号采用「近期动量」(基于最近8期数据)")
-    print(f"  6号池 : {p6} | 特别号: {special_text}")
-    print(f"  10号池: {p10} | 特别号: {special_text}")
-    print(f"  14号池: {p14} | 特别号: {special_text}")
-    print(f"  20号池: {p20} | 特别号: {special_text}")
+    print(f"策略说明: 主号采用「冷号回补」(基于最近8期数据)")
+    print(f"  6号池 : {p6}")
+    print(f"  10号池: {p10}")
+    print(f"  14号池: {p14}")
+    print(f"  20号池: {p20}")
+    print(f"特别号候选1 (近期动量): {special_mom_text}")
+    print(f"特别号候选2 (规律挖掘): {special_pattern_text}")
     print("=" * 50)
 
 
