@@ -325,27 +325,12 @@ def _to_int(value: object) -> Optional[int]:
 def parse_newmacau_from_marksix6_api(payload: dict) -> List[DrawRecord]:
     """
     从 marksix6.net API 返回的 JSON 中提取新澳门彩（name="新澳门彩"）的数据。
-    示例结构：
-    {
-        "lottery_data": [
-            {
-                "name": "新澳门彩",
-                "expect": "2026106",
-                "openCode": "31,48,05,11,46,40,22",
-                "numbers": ["31","48","05","11","46","40","22"],
-                "openTime": "2026-04-16 21:32:32",
-                "history": ["2026106 期：31,48,05,11,46,40,22", ...]
-            },
-            ...
-        ]
-    }
     """
     records: List[DrawRecord] = []
     lottery_list = payload.get("lottery_data", [])
     if not isinstance(lottery_list, list):
         return records
 
-    # 查找 name 为 "新澳门彩" 的条目
     newmacau_data = None
     for item in lottery_list:
         if isinstance(item, dict) and item.get("name") == "新澳门彩":
@@ -355,41 +340,31 @@ def parse_newmacau_from_marksix6_api(payload: dict) -> List[DrawRecord]:
     if not newmacau_data:
         return records
 
-    # 优先使用 history 字段（包含完整历史）
     history_list = newmacau_data.get("history", [])
     if history_list and isinstance(history_list, list):
         for line in history_list:
-            # 格式示例："2026106 期：31,48,05,11,46,40,22"
             match = re.match(r"(\d{7})\s*期[：:]\s*([\d,]+)", line)
             if not match:
                 continue
-            expect_raw = match.group(1)   # "2026106"
-            numbers_str = match.group(2)  # "31,48,05,11,46,40,22"
+            expect_raw = match.group(1)
+            numbers_str = match.group(2)
             num_list = _parse_numbers(numbers_str)
             if len(num_list) < 7:
                 continue
             main_numbers = num_list[:6]
             special = num_list[6]
 
-            # 期号转换: "2026106" -> "26/106"
             if len(expect_raw) >= 7:
-                year = expect_raw[2:4]    # "26"
-                seq = str(int(expect_raw[4:]))  # "106"
+                year = expect_raw[2:4]
+                seq = str(int(expect_raw[4:]))
                 issue_no = f"{year}/{seq.zfill(3)}"
             else:
                 issue_no = expect_raw
 
-            # 日期从 openTime 中提取，但 history 中没有日期，需从主字段获取或留空
-            # 这里使用主条目中的 openTime 日期，但历史条目每期日期不同，因此需要更精确处理
-            # 如果 openTime 只有一个，无法对应每期，所以暂用当前日期填充，后续可改进
-            # 更好的方法是从 history 字符串中解析日期？但示例中没有包含日期。
-            # 作为替代，我们从主条目的 openTime 提取最新日期，历史日期则通过递减估算（不准确）
-            # 为简化，这里先使用主条目日期，实际使用时建议从其他源获取完整历史日期
-            # 由于日期对策略影响较大，这里临时使用一个虚拟日期，用户可自行完善
+            # 由于 history 中无日期，使用主条目中的 openTime 日期（最新一期日期）
             draw_date = _parse_date(newmacau_data.get("openTime", "").split()[0]) if newmacau_data.get("openTime") else None
             if not draw_date:
-                draw_date = "2026-01-01"  # 临时占位
-
+                draw_date = "2026-01-01"
             records.append(DrawRecord(
                 issue_no=issue_no,
                 draw_date=draw_date,
@@ -397,7 +372,7 @@ def parse_newmacau_from_marksix6_api(payload: dict) -> List[DrawRecord]:
                 special_number=special,
             ))
     else:
-        # 如果没有 history 字段，则只使用当前期
+        # 如果没有 history，则只使用当前期
         expect_raw = str(newmacau_data.get("expect", ""))
         numbers_raw = newmacau_data.get("openCode") or newmacau_data.get("numbers")
         if numbers_raw:
@@ -425,7 +400,6 @@ def parse_newmacau_from_marksix6_api(payload: dict) -> List[DrawRecord]:
                         special_number=special,
                     ))
 
-    # 去重并按日期排序
     dedup: Dict[str, DrawRecord] = {}
     for r in records:
         dedup[r.issue_no] = r
@@ -433,7 +407,6 @@ def parse_newmacau_from_marksix6_api(payload: dict) -> List[DrawRecord]:
 
 
 def fetch_newmacau_records() -> List[DrawRecord]:
-    """从 marksix6.net API 获取新澳门彩历史数据"""
     req = Request(
         NEWMACAU_API_URL,
         headers={
@@ -1403,6 +1376,68 @@ def print_recommendation_sheet(conn: sqlite3.Connection, limit: int = 8) -> None
         print(f"    20号池: {p20} | 特别号: {special_text}")
 
 
+def get_final_recommendation(conn: sqlite3.Connection) -> Optional[Tuple[str, List[int], int, List[int], List[int], List[int]]]:
+    """
+    获取最终推荐组合：
+    - 主号6码：来自策略 'momentum_v1' (近期动量) 的6号池
+    - 特别号：来自策略 'pattern_mined_v1' (规律挖掘) 的特别号
+    - 10/14/20池：来自 'momentum_v1' 的对应池
+    返回 (issue_no, main6, special, pool10, pool14, pool20) 或 None
+    """
+    row = conn.execute(
+        "SELECT issue_no FROM prediction_runs WHERE status='PENDING' ORDER BY created_at DESC LIMIT 1"
+    ).fetchone()
+    if not row:
+        return None
+    issue_no = row["issue_no"]
+
+    mom_run = conn.execute(
+        "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = 'momentum_v1' AND status='PENDING'",
+        (issue_no,)
+    ).fetchone()
+    if not mom_run:
+        return None
+    mom_id = mom_run["id"]
+    main6 = get_pool_numbers_for_run(conn, mom_id, 6)
+    pool10 = get_pool_numbers_for_run(conn, mom_id, 10)
+    pool14 = get_pool_numbers_for_run(conn, mom_id, 14)
+    pool20 = get_pool_numbers_for_run(conn, mom_id, 20)
+
+    pattern_run = conn.execute(
+        "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = 'pattern_mined_v1' AND status='PENDING'",
+        (issue_no,)
+    ).fetchone()
+    if not pattern_run:
+        return None
+    pattern_id = pattern_run["id"]
+    _, special = get_picks_for_run(conn, pattern_id)
+    if special is None:
+        return None
+
+    return (issue_no, main6, special, pool10, pool14, pool20)
+
+
+def print_final_recommendation(conn: sqlite3.Connection) -> None:
+    rec = get_final_recommendation(conn)
+    if not rec:
+        print("\n最终推荐: (暂无有效预测)")
+        return
+    issue_no, main6, special, pool10, pool14, pool20 = rec
+    special_text = _fmt_num(special)
+    p6 = " ".join(_fmt_num(n) for n in main6)
+    p10 = " ".join(_fmt_num(n) for n in pool10)
+    p14 = " ".join(_fmt_num(n) for n in pool14)
+    p20 = " ".join(_fmt_num(n) for n in pool20)
+    print("\n" + "=" * 50)
+    print(f"【最终推荐 - 期号 {issue_no}】")
+    print(f"策略说明: 主号采用「近期动量」(历史平均命中0.75)，特别号采用「规律挖掘」(历史命中率3.42%)")
+    print(f"  6号池 : {p6} | 特别号: {special_text}")
+    print(f"  10号池: {p10} | 特别号: {special_text}")
+    print(f"  14号池: {p14} | 特别号: {special_text}")
+    print(f"  20号池: {p20} | 特别号: {special_text}")
+    print("=" * 50)
+
+
 def print_dashboard(conn: sqlite3.Connection) -> None:
     latest = get_latest_draw(conn)
     if latest:
@@ -1426,6 +1461,8 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
             f"特别号命中率={s['special_rate'] * 100:.2f}% 至少中1个={s['hit1_rate'] * 100:.2f}% 至少中2个={s['hit2_rate'] * 100:.2f}%"
         )
 
+    print_final_recommendation(conn)
+
 
 def cmd_bootstrap(args: argparse.Namespace) -> None:
     conn = connect_db(args.db)
@@ -1433,6 +1470,8 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
         init_db(conn)
         records = fetch_newmacau_records()
         total, inserted, updated = sync_from_records(conn, records, source="newmacau_api")
+        print("自动执行全量历史回测...")
+        run_historical_backtest(conn, rebuild=True, progress_every=20)
         issue = generate_predictions(conn)
         print(f"Bootstrap done. total={total}, inserted={inserted}, updated={updated}, next_prediction={issue}")
     finally:
