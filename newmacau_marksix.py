@@ -21,6 +21,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 DB_PATH_DEFAULT = str(SCRIPT_DIR / "newmacau_marksix.db")
 CSV_PATH_DEFAULT = str(SCRIPT_DIR / "NewMacau_Mark_Six.csv")
 
+# 澳门数据源（使用 marksix6.net API 中的“新澳门彩”）
 MACAU_API_URL = "https://marksix6.net/index.php?api=1"
 
 MINED_CONFIG_KEY = "mined_strategy_config_v1"
@@ -35,6 +36,7 @@ STRATEGY_LABELS = {
 }
 STRATEGY_IDS = ["balanced_v1", "hot_v1", "cold_rebound_v1", "momentum_v1", "ensemble_v2", "pattern_mined_v1"]
 
+# 生肖映射
 ZODIAC_MAP = {
     "鼠": [7,19,31,43],
     "牛": [6,18,30,42],
@@ -1408,47 +1410,69 @@ def print_recommendation_sheet(conn: sqlite3.Connection, limit: int = 8) -> None
         print(f"    20号池: {p20} | 特别号: {special_text}")
 
 
-def get_best_zodiac(conn: sqlite3.Connection, window: int = 3) -> Tuple[str, float]:
-    draws = load_recent_draws(conn, window)   # 修正函数名
-    if not draws:
+# ========== 新增：基于得分的生肖预测 ==========
+def get_best_zodiac_by_score(conn: sqlite3.Connection, issue_no: str) -> Tuple[str, float]:
+    """基于策略得分预测一肖：计算每个生肖对应号码的平均得分，选择最高分的生肖"""
+    # 获取 ensemble 策略的 raw_scores
+    ensemble_run = conn.execute(
+        "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = 'ensemble_v2' AND status='PENDING'",
+        (issue_no,)
+    ).fetchone()
+    if not ensemble_run:
         return "龙", 0.0
-    zodiac_count = {z: 0 for z in ZODIAC_MAP}
-    for draw in draws:
-        for n in draw:
-            for z, nums in ZODIAC_MAP.items():
-                if n in nums:
-                    zodiac_count[z] += 1
-                    break
-    total = len(draws) * 6
-    if total == 0:
-        return "龙", 0.0
-    best_zodiac = max(zodiac_count.items(), key=lambda x: x[1])
-    rate = best_zodiac[1] / total * 100
-    return best_zodiac[0], rate
+    # 重新计算 raw_scores（由于数据库未保存，需重新计算）
+    draws = load_recent_draws(conn, 3)
+    specials = [r[0] for r in conn.execute("SELECT special_number FROM draws ORDER BY draw_date DESC LIMIT 3").fetchall()]
+    pair_lift = calculate_pair_lift(draws)
+    today = date.today()
+    _, day_zhi, day_wuxing = get_day_ganzhi(today)
+    score = ensemble_vote(draws, specials, pair_lift, use_dynamic_weights=True, day_wuxing=day_wuxing, day_zhi=day_zhi)
+    final_scores = score.raw_scores
+
+    zodiac_scores = {z: 0.0 for z in ZODIAC_MAP}
+    zodiac_counts = {z: 0 for z in ZODIAC_MAP}
+    for n, s in final_scores.items():
+        for z, nums in ZODIAC_MAP.items():
+            if n in nums:
+                zodiac_scores[z] += s
+                zodiac_counts[z] += 1
+                break
+    avg_scores = {z: zodiac_scores[z] / zodiac_counts[z] if zodiac_counts[z] > 0 else 0.0 for z in ZODIAC_MAP}
+    best_zodiac = max(avg_scores.items(), key=lambda x: x[1])[0]
+    best_score = avg_scores[best_zodiac]
+    return best_zodiac, best_score
 
 
-def get_best_trio_from_main6(conn: sqlite3.Connection, main6: List[int]) -> Optional[List[int]]:
-    if len(main6) < 5:
+# ========== 新增：基于得分的三中三推荐（前10高分号码枚举3码）==========
+def get_best_trio_by_score(conn: sqlite3.Connection, issue_no: str) -> Optional[List[int]]:
+    """基于策略得分，从得分最高的前10个号码中枚举所有3码组合，选择得分+pair_lift最高的组合"""
+    ensemble_run = conn.execute(
+        "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = 'ensemble_v2' AND status='PENDING'",
+        (issue_no,)
+    ).fetchone()
+    if not ensemble_run:
         return None
-    hot5 = sorted(main6[:5])
-    rows = conn.execute(
-        "SELECT numbers_json FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT 30"
-    ).fetchall()
-    draws = [json.loads(r[0]) for r in rows]
-    if len(draws) < 3:
-        return None
-    trio_counter = Counter()
-    for combo in combinations(hot5, 3):
-        trio_counter[combo] = 0
-    for draw in draws:
-        draw_set = set(draw)
-        for trio in trio_counter.keys():
-            if all(n in draw_set for n in trio):
-                trio_counter[trio] += 1
-    if not trio_counter:
-        return None
-    best_trio = max(trio_counter.items(), key=lambda x: x[1])[0]
-    return list(best_trio)
+    draws = load_recent_draws(conn, 3)
+    specials = [r[0] for r in conn.execute("SELECT special_number FROM draws ORDER BY draw_date DESC LIMIT 3").fetchall()]
+    pair_lift = calculate_pair_lift(draws)
+    today = date.today()
+    _, day_zhi, day_wuxing = get_day_ganzhi(today)
+    score = ensemble_vote(draws, specials, pair_lift, use_dynamic_weights=True, day_wuxing=day_wuxing, day_zhi=day_zhi)
+    final_scores = score.raw_scores
+
+    sorted_nums = sorted(final_scores.items(), key=lambda x: x[1], reverse=True)
+    candidates = [n for n, _ in sorted_nums[:10]]  # 前10个高分号码
+    best_combo = None
+    best_combo_score = -1e9
+    for combo in combinations(candidates, 3):
+        combo = sorted(combo)
+        combo_score = sum(final_scores[n] for n in combo)
+        for a, b in combinations(combo, 2):
+            combo_score += pair_lift.get((a, b), 0) * 0.2
+        if combo_score > best_combo_score:
+            best_combo_score = combo_score
+            best_combo = combo
+    return list(best_combo) if best_combo else None
 
 
 def get_final_recommendation(conn: sqlite3.Connection) -> Optional[Tuple[str, List[int], List[int], List[int], int, int, List[int], List[int], List[int], str, float, List[int]]]:
@@ -1459,6 +1483,7 @@ def get_final_recommendation(conn: sqlite3.Connection) -> Optional[Tuple[str, Li
         return None
     issue_no = row["issue_no"]
 
+    # 规律挖掘
     pattern_run = conn.execute(
         "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = 'pattern_mined_v1' AND status='PENDING'",
         (issue_no,)
@@ -1471,18 +1496,21 @@ def get_final_recommendation(conn: sqlite3.Connection) -> Optional[Tuple[str, Li
     pool14_pattern = get_pool_numbers_for_run(conn, pattern_id, 14)
     pool20_pattern = get_pool_numbers_for_run(conn, pattern_id, 20)
 
+    # 集成投票
     ensemble_run = conn.execute(
         "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = 'ensemble_v2' AND status='PENDING'",
         (issue_no,)
     ).fetchone()
     main6_ensemble = get_pool_numbers_for_run(conn, ensemble_run["id"], 6) if ensemble_run else []
 
+    # 组合策略
     balanced_run = conn.execute(
         "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = 'balanced_v1' AND status='PENDING'",
         (issue_no,)
     ).fetchone()
     main6_balanced = get_pool_numbers_for_run(conn, balanced_run["id"], 6) if balanced_run else []
 
+    # 特别号候选
     mom_run = conn.execute(
         "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = 'momentum_v1' AND status='PENDING'",
         (issue_no,)
@@ -1495,8 +1523,12 @@ def get_final_recommendation(conn: sqlite3.Connection) -> Optional[Tuple[str, Li
     if pattern_run:
         _, special_pattern = get_picks_for_run(conn, pattern_run["id"])
 
-    best_zodiac, zodiac_rate = get_best_zodiac(conn, window=3)
-    best_trio = get_best_trio_from_main6(conn, main6_pattern)
+    # 基于得分的生肖预测
+    best_zodiac, zodiac_score = get_best_zodiac_by_score(conn, issue_no)
+    zodiac_rate = zodiac_score * 100   # 转为百分数表示
+
+    # 基于得分的三中三推荐
+    best_trio = get_best_trio_by_score(conn, issue_no)
 
     if special_momentum is None and special_pattern is None:
         return None
@@ -1536,8 +1568,8 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     print(f"  20号池 (规律挖掘): {p20}")
     print(f"特别号候选1 (近期动量): {special_mom_text}")
     print(f"特别号候选2 (规律挖掘): {special_pattern_text}")
-    print(f"一肖推荐: {best_zodiac} (近3期命中率 {zodiac_rate:.1f}%)")
-    print(f"三中三推荐 (规律挖掘6码池前5个): {trio_str}")
+    print(f"一肖推荐: {best_zodiac} (模型得分 {zodiac_rate:.1f}%)")
+    print(f"三中三推荐 (前10高分号码枚举): {trio_str}")
     print("=" * 50)
 
 
