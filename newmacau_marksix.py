@@ -10,7 +10,7 @@ import sqlite3
 import time
 from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from itertools import combinations
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -1443,7 +1443,7 @@ def get_best_trio_from_main6(conn: sqlite3.Connection, main6: List[int]) -> Opti
     return list(best_trio)
 
 
-# ========== 修改最终推荐：增加生肖和三中三 ==========
+# ========== 最终推荐（包含生肖和三中三）==========
 def get_final_recommendation(conn: sqlite3.Connection) -> Optional[Tuple[str, List[int], List[int], List[int], int, int, List[int], List[int], List[int], str, float, List[int]]]:
     """
     获取最终推荐组合：
@@ -1650,45 +1650,9 @@ def cmd_show(args: argparse.Namespace) -> None:
         init_db(conn)
         backfill_missing_special_picks(conn)
         print_dashboard(conn)
-
-def cmd_show(args: argparse.Namespace) -> None:
-    conn = connect_db(args.db)
-    try:
-        init_db(conn)
-        backfill_missing_special_picks(conn)
-        print_dashboard(conn)
-
-        # ---------- 微信推送（增加生肖和三中三）----------
-        final_rec = get_final_recommendation(conn)
-        if final_rec:
-            (issue_no, main6_pattern, _, _, special_mom, special_pattern, _, _, _,
-             best_zodiac, zodiac_rate, best_trio) = final_rec
-            special_mom_text = _fmt_num(special_mom) if special_mom else "无"
-            special_pattern_text = _fmt_num(special_pattern) if special_pattern else "无"
-            trio_str = " ".join(_fmt_num(n) for n in best_trio) if best_trio else "无"
-            main6_str = " ".join(_fmt_num(n) for n in main6_pattern) if main6_pattern else "无"
-        else:
-            issue_no = "未知"
-            special_mom_text = special_pattern_text = trio_str = "无"
-            best_zodiac = "龙"
-            zodiac_rate = 0.0
-            main6_str = "无"
-
-        today = date.today()
-        day_gan, day_zhi, day_wuxing = get_day_ganzhi(today)
-
-        push_lines = []
-        push_lines.append(f"【新澳门·{issue_no}期推荐】")
-        push_lines.append(f"今日{day_gan}{day_zhi}日 五行{day_wuxing} · 玄学权重{FENGSHUI_POWER*100:.0f}%")
-        push_lines.append(f"🐉 一肖推荐：{best_zodiac} (近3期命中率{zodiac_rate:.1f}%)")
-        push_lines.append(f"🎲 主号候选（规律挖掘）：{main6_str}")
-        push_lines.append(f"🔮 特别号候选：{special_mom_text} / {special_pattern_text}")
-        push_lines.append(f"🏆 三中三推荐：{trio_str}")
-
-        send_pushplus_notification("新澳门预测", "\n".join(push_lines))
-
     finally:
         conn.close()
+
 
 def cmd_backtest(args: argparse.Namespace) -> None:
     conn = connect_db(args.db)
