@@ -8,8 +8,10 @@ import json
 import re
 import sqlite3
 import time
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from itertools import combinations
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 from urllib.request import Request, urlopen
@@ -32,6 +34,22 @@ STRATEGY_LABELS = {
     "pattern_mined_v1": "规律挖掘",
 }
 STRATEGY_IDS = ["balanced_v1", "hot_v1", "cold_rebound_v1", "momentum_v1", "ensemble_v2", "pattern_mined_v1"]
+
+# 生肖映射（用于生肖推荐）
+ZODIAC_MAP = {
+    "鼠": [7,19,31,43],
+    "牛": [6,18,30,42],
+    "虎": [5,17,29,41],
+    "兔": [4,16,28,40],
+    "龙": [3,15,27,39],
+    "蛇": [2,14,26,38],
+    "马": [1,13,25,37,49],
+    "羊": [12,24,36,48],
+    "猴": [11,23,35,47],
+    "鸡": [10,22,34,46],
+    "狗": [9,21,33,45],
+    "猪": [8,20,32,44],
+}
 
 
 @dataclass
@@ -535,7 +553,6 @@ def missing_issues_since_latest(conn: sqlite3.Connection, incoming: List[DrawRec
     return missing
 
 
-# ========== 预测窗口改为3期 ==========
 def load_recent_draws(conn: sqlite3.Connection, limit: int = 3) -> List[List[int]]:
     rows = conn.execute(
         "SELECT numbers_json FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT ?",
@@ -1379,8 +1396,55 @@ def print_recommendation_sheet(conn: sqlite3.Connection, limit: int = 8) -> None
         print(f"    20号池: {p20} | 特别号: {special_text}")
 
 
-# ========== 修改最终推荐：主号三个候选（规律挖掘、集成投票、组合策略） ==========
-def get_final_recommendation(conn: sqlite3.Connection) -> Optional[Tuple[str, List[int], List[int], List[int], int, int, List[int], List[int], List[int]]]:
+# ========== 新增：获取高命中生肖 ==========
+def get_best_zodiac(conn: sqlite3.Connection, window: int = 3) -> Tuple[str, float]:
+    """返回最近 window 期内命中率最高的生肖及其命中率（基于主号）"""
+    draws = get_recent_draws(conn, window)
+    if not draws:
+        return "龙", 0.0
+    zodiac_count = {z: 0 for z in ZODIAC_MAP}
+    for draw in draws:
+        for n in draw:
+            for z, nums in ZODIAC_MAP.items():
+                if n in nums:
+                    zodiac_count[z] += 1
+                    break
+    total = len(draws) * 6
+    if total == 0:
+        return "龙", 0.0
+    best_zodiac = max(zodiac_count.items(), key=lambda x: x[1])
+    rate = best_zodiac[1] / total * 100
+    return best_zodiac[0], rate
+
+
+# ========== 新增：获取三中三推荐 ==========
+def get_best_trio_from_main6(conn: sqlite3.Connection, main6: List[int]) -> Optional[List[int]]:
+    """从主号6码的前5个号码中，找出历史同时出现频率最高的3码组合"""
+    if len(main6) < 5:
+        return None
+    hot5 = sorted(main6[:5])
+    rows = conn.execute(
+        "SELECT numbers_json FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT 30"
+    ).fetchall()
+    draws = [json.loads(r[0]) for r in rows]
+    if len(draws) < 3:
+        return None
+    trio_counter = Counter()
+    for combo in combinations(hot5, 3):
+        trio_counter[combo] = 0
+    for draw in draws:
+        draw_set = set(draw)
+        for trio in trio_counter.keys():
+            if all(n in draw_set for n in trio):
+                trio_counter[trio] += 1
+    if not trio_counter:
+        return None
+    best_trio = max(trio_counter.items(), key=lambda x: x[1])[0]
+    return list(best_trio)
+
+
+# ========== 修改最终推荐：增加生肖和三中三 ==========
+def get_final_recommendation(conn: sqlite3.Connection) -> Optional[Tuple[str, List[int], List[int], List[int], int, int, List[int], List[int], List[int], str, float, List[int]]]:
     """
     获取最终推荐组合：
     - 主号候选1：规律挖掘的6号池
@@ -1388,8 +1452,9 @@ def get_final_recommendation(conn: sqlite3.Connection) -> Optional[Tuple[str, Li
     - 主号候选3：组合策略的6号池
     - 特别号候选1：近期动量的特别号
     - 特别号候选2：规律挖掘的特别号
-    - 以及各自的10/14/20池（仅展示主号候选对应的池，这里简化，只展示规律挖掘的池作为参考）
-    返回 (issue_no, main6_pattern, main6_ensemble, main6_balanced, special_momentum, special_pattern, pool10_pattern, pool14_pattern, pool20_pattern)
+    - 规律挖掘的10/14/20池
+    - 高命中生肖及命中率
+    - 三中三推荐（基于规律挖掘6号池的前5个号码）
     """
     row = conn.execute(
         "SELECT issue_no FROM prediction_runs WHERE status='PENDING' ORDER BY created_at DESC LIMIT 1"
@@ -1438,12 +1503,19 @@ def get_final_recommendation(conn: sqlite3.Connection) -> Optional[Tuple[str, Li
     if pattern_run:
         _, special_pattern = get_picks_for_run(conn, pattern_run["id"])
 
+    # 高命中生肖
+    best_zodiac, zodiac_rate = get_best_zodiac(conn, window=3)
+
+    # 三中三推荐
+    best_trio = get_best_trio_from_main6(conn, main6_pattern)
+
     if special_momentum is None and special_pattern is None:
         return None
 
     return (issue_no, main6_pattern, main6_ensemble, main6_balanced,
             special_momentum, special_pattern,
-            pool10_pattern, pool14_pattern, pool20_pattern)
+            pool10_pattern, pool14_pattern, pool20_pattern,
+            best_zodiac, zodiac_rate, best_trio)
 
 
 def print_final_recommendation(conn: sqlite3.Connection) -> None:
@@ -1453,7 +1525,8 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
         return
     (issue_no, main6_pattern, main6_ensemble, main6_balanced,
      special_mom, special_pattern,
-     pool10, pool14, pool20) = rec
+     pool10, pool14, pool20,
+     best_zodiac, zodiac_rate, best_trio) = rec
     special_mom_text = _fmt_num(special_mom) if special_mom is not None else "--"
     special_pattern_text = _fmt_num(special_pattern) if special_pattern is not None else "--"
     p6_pattern = " ".join(_fmt_num(n) for n in main6_pattern)
@@ -1462,6 +1535,7 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     p10 = " ".join(_fmt_num(n) for n in pool10)
     p14 = " ".join(_fmt_num(n) for n in pool14)
     p20 = " ".join(_fmt_num(n) for n in pool20)
+    trio_str = " ".join(_fmt_num(n) for n in best_trio) if best_trio else "无"
     print("\n" + "=" * 50)
     print(f"【最终推荐 - 期号 {issue_no}】")
     print(f"策略说明: 主号提供三个候选（规律挖掘、集成投票、组合策略），均基于最近3期数据")
@@ -1473,6 +1547,8 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     print(f"  20号池 (规律挖掘): {p20}")
     print(f"特别号候选1 (近期动量): {special_mom_text}")
     print(f"特别号候选2 (规律挖掘): {special_pattern_text}")
+    print(f"一肖推荐: {best_zodiac} (近3期命中率 {zodiac_rate:.1f}%)")
+    print(f"三中三推荐 (规律挖掘6码池前5个): {trio_str}")
     print("=" * 50)
 
 
@@ -1574,6 +1650,36 @@ def cmd_show(args: argparse.Namespace) -> None:
         init_db(conn)
         backfill_missing_special_picks(conn)
         print_dashboard(conn)
+
+        # ---------- 微信推送（增加生肖和三中三）----------
+        # 重新获取最终推荐（含新增字段）
+        final_rec = get_final_recommendation(conn)
+        if final_rec:
+            (issue_no, _, _, _, special_mom, special_pattern, _, _, _,
+             best_zodiac, zodiac_rate, best_trio) = final_rec
+            special_mom_text = _fmt_num(special_mom) if special_mom else "无"
+            special_pattern_text = _fmt_num(special_pattern) if special_pattern else "无"
+            trio_str = " ".join(_fmt_num(n) for n in best_trio) if best_trio else "无"
+        else:
+            issue_no = "未知"
+            special_mom_text = special_pattern_text = trio_str = "无"
+            best_zodiac = "龙"
+            zodiac_rate = 0.0
+
+        today = date.today()
+        day_gan, day_zhi, day_wuxing = get_day_ganzhi(today)
+
+        push_lines = []
+        push_lines.append(f"【新澳门·{issue_no}期推荐】")
+        push_lines.append(f"今日{day_gan}{day_zhi}日 五行{day_wuxing} · 玄学权重{FENGSHUI_POWER*100:.0f}%")
+        push_lines.append(f"🐉 一肖推荐：{best_zodiac} (近3期命中率{zodiac_rate:.1f}%)")
+        push_lines.append(f"🎲 主号候选（规律挖掘）：{' '.join(_fmt_num(n) for n in final_rec[1] if final_rec else [])}")
+        push_lines.append(f"🔮 特别号候选：{special_mom_text} / {special_pattern_text}")
+        push_lines.append(f"🏆 三中三推荐：{trio_str}")
+        # 原有的其他推送内容可根据需要继续添加
+
+        send_pushplus_notification("新澳门预测", "\n".join(push_lines))
+
     finally:
         conn.close()
 
