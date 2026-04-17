@@ -15,12 +15,12 @@ from itertools import combinations
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 from urllib.request import Request, urlopen
+from urllib.error import URLError
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DB_PATH_DEFAULT = str(SCRIPT_DIR / "newmacau_marksix.db")
 CSV_PATH_DEFAULT = str(SCRIPT_DIR / "NewMacau_Mark_Six.csv")
 
-# 澳门数据源（使用 marksix6.net API 中的“新澳门彩”）
 MACAU_API_URL = "https://marksix6.net/index.php?api=1"
 
 MINED_CONFIG_KEY = "mined_strategy_config_v1"
@@ -35,7 +35,6 @@ STRATEGY_LABELS = {
 }
 STRATEGY_IDS = ["balanced_v1", "hot_v1", "cold_rebound_v1", "momentum_v1", "ensemble_v2", "pattern_mined_v1"]
 
-# 生肖映射
 ZODIAC_MAP = {
     "鼠": [7,19,31,43],
     "牛": [6,18,30,42],
@@ -419,21 +418,34 @@ def parse_macau_from_marksix6_api(payload: dict) -> List[DrawRecord]:
     return sorted(dedup.values(), key=lambda r: (r.draw_date, r.issue_no))
 
 
-def fetch_macau_records() -> List[DrawRecord]:
-    req = Request(
-        MACAU_API_URL,
-        headers={
-            "User-Agent": "Mozilla/5.0 (compatible; macau-local/1.0)",
-            "Accept": "application/json",
-        },
-    )
-    with urlopen(req, timeout=20) as resp:
-        raw = resp.read().decode("utf-8-sig")
-    payload = json.loads(raw)
-    records = parse_macau_from_marksix6_api(payload)
-    if not records:
-        raise RuntimeError("澳门彩数据解析失败，请检查API返回格式")
-    return records
+def fetch_macau_records(retry: int = 3, timeout: int = 60) -> List[DrawRecord]:
+    for attempt in range(1, retry + 1):
+        try:
+            req = Request(
+                MACAU_API_URL,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (compatible; macau-local/1.0)",
+                    "Accept": "application/json",
+                },
+            )
+            with urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8-sig")
+            payload = json.loads(raw)
+            records = parse_macau_from_marksix6_api(payload)
+            if records:
+                print(f"成功获取 {len(records)} 条记录 (尝试 {attempt}/{retry})")
+                return records
+        except Exception as e:
+            print(f"API 请求失败 (尝试 {attempt}/{retry}): {e}")
+            if attempt < retry:
+                time.sleep(5)
+    print("API 失败，尝试从 CSV 导入...")
+    if Path(CSV_PATH_DEFAULT).exists():
+        records = parse_draw_csv(CSV_PATH_DEFAULT)
+        if records:
+            print(f"从 CSV 导入 {len(records)} 条记录")
+            return records
+    raise RuntimeError("无法获取澳门彩数据，请检查网络或提供 CSV 文件")
 
 
 def upsert_draw(conn: sqlite3.Connection, record: DrawRecord, source: str) -> str:
@@ -1397,7 +1409,7 @@ def print_recommendation_sheet(conn: sqlite3.Connection, limit: int = 8) -> None
 
 
 def get_best_zodiac(conn: sqlite3.Connection, window: int = 3) -> Tuple[str, float]:
-    draws = get_recent_draws(conn, window)
+    draws = load_recent_draws(conn, window)   # 修正函数名
     if not draws:
         return "龙", 0.0
     zodiac_count = {z: 0 for z in ZODIAC_MAP}
