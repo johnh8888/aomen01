@@ -535,7 +535,7 @@ def missing_issues_since_latest(conn: sqlite3.Connection, incoming: List[DrawRec
     return missing
 
 
-# ========== 修改：预测窗口改为3期 ==========
+# ========== 预测窗口改为3期 ==========
 def load_recent_draws(conn: sqlite3.Connection, limit: int = 3) -> List[List[int]]:
     rows = conn.execute(
         "SELECT numbers_json FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT ?",
@@ -1020,7 +1020,6 @@ def run_historical_backtest(
         if existing and int(existing["c"]) >= len(STRATEGY_IDS):
             continue
 
-        # 历史取最近4期（因为需要至少3期，所以取 i-1 到 i-4）
         history_desc = [json.loads(draws[j]["numbers_json"]) for j in range(i - 1, max(-1, i - 4), -1)]
         if len(history_desc) < min_history:
             continue
@@ -1380,14 +1379,17 @@ def print_recommendation_sheet(conn: sqlite3.Connection, limit: int = 8) -> None
         print(f"    20号池: {p20} | 特别号: {special_text}")
 
 
-def get_final_recommendation(conn: sqlite3.Connection) -> Optional[Tuple[str, List[int], int, int, List[int], List[int], List[int]]]:
+# ========== 修改最终推荐：主号三个候选（规律挖掘、集成投票、组合策略） ==========
+def get_final_recommendation(conn: sqlite3.Connection) -> Optional[Tuple[str, List[int], List[int], List[int], int, int, List[int], List[int], List[int]]]:
     """
     获取最终推荐组合：
-    - 主号6码：来自策略 'cold_rebound_v1' (冷号回补) 的6号池
-    - 特别号候选1：来自策略 'momentum_v1' (近期动量) 的特别号
-    - 特别号候选2：来自策略 'pattern_mined_v1' (规律挖掘) 的特别号
-    - 10/14/20池：来自 'cold_rebound_v1' 的对应池
-    返回 (issue_no, main6, special_momentum, special_pattern, pool10, pool14, pool20)
+    - 主号候选1：规律挖掘的6号池
+    - 主号候选2：集成投票的6号池
+    - 主号候选3：组合策略的6号池
+    - 特别号候选1：近期动量的特别号
+    - 特别号候选2：规律挖掘的特别号
+    - 以及各自的10/14/20池（仅展示主号候选对应的池，这里简化，只展示规律挖掘的池作为参考）
+    返回 (issue_no, main6_pattern, main6_ensemble, main6_balanced, special_momentum, special_pattern, pool10_pattern, pool14_pattern, pool20_pattern)
     """
     row = conn.execute(
         "SELECT issue_no FROM prediction_runs WHERE status='PENDING' ORDER BY created_at DESC LIMIT 1"
@@ -1396,20 +1398,34 @@ def get_final_recommendation(conn: sqlite3.Connection) -> Optional[Tuple[str, Li
         return None
     issue_no = row["issue_no"]
 
-    # 冷号回补策略作为主号来源
-    cold_run = conn.execute(
-        "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = 'cold_rebound_v1' AND status='PENDING'",
+    # 规律挖掘
+    pattern_run = conn.execute(
+        "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = 'pattern_mined_v1' AND status='PENDING'",
         (issue_no,)
     ).fetchone()
-    if not cold_run:
+    if not pattern_run:
         return None
-    cold_id = cold_run["id"]
-    main6 = get_pool_numbers_for_run(conn, cold_id, 6)
-    pool10 = get_pool_numbers_for_run(conn, cold_id, 10)
-    pool14 = get_pool_numbers_for_run(conn, cold_id, 14)
-    pool20 = get_pool_numbers_for_run(conn, cold_id, 20)
+    pattern_id = pattern_run["id"]
+    main6_pattern = get_pool_numbers_for_run(conn, pattern_id, 6)
+    pool10_pattern = get_pool_numbers_for_run(conn, pattern_id, 10)
+    pool14_pattern = get_pool_numbers_for_run(conn, pattern_id, 14)
+    pool20_pattern = get_pool_numbers_for_run(conn, pattern_id, 20)
 
-    # 近期动量策略的特别号
+    # 集成投票
+    ensemble_run = conn.execute(
+        "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = 'ensemble_v2' AND status='PENDING'",
+        (issue_no,)
+    ).fetchone()
+    main6_ensemble = get_pool_numbers_for_run(conn, ensemble_run["id"], 6) if ensemble_run else []
+
+    # 组合策略
+    balanced_run = conn.execute(
+        "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = 'balanced_v1' AND status='PENDING'",
+        (issue_no,)
+    ).fetchone()
+    main6_balanced = get_pool_numbers_for_run(conn, balanced_run["id"], 6) if balanced_run else []
+
+    # 特别号候选
     mom_run = conn.execute(
         "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = 'momentum_v1' AND status='PENDING'",
         (issue_no,)
@@ -1418,11 +1434,6 @@ def get_final_recommendation(conn: sqlite3.Connection) -> Optional[Tuple[str, Li
     if mom_run:
         _, special_momentum = get_picks_for_run(conn, mom_run["id"])
 
-    # 规律挖掘策略的特别号
-    pattern_run = conn.execute(
-        "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = 'pattern_mined_v1' AND status='PENDING'",
-        (issue_no,)
-    ).fetchone()
     special_pattern = None
     if pattern_run:
         _, special_pattern = get_picks_for_run(conn, pattern_run["id"])
@@ -1430,7 +1441,9 @@ def get_final_recommendation(conn: sqlite3.Connection) -> Optional[Tuple[str, Li
     if special_momentum is None and special_pattern is None:
         return None
 
-    return (issue_no, main6, special_momentum, special_pattern, pool10, pool14, pool20)
+    return (issue_no, main6_pattern, main6_ensemble, main6_balanced,
+            special_momentum, special_pattern,
+            pool10_pattern, pool14_pattern, pool20_pattern)
 
 
 def print_final_recommendation(conn: sqlite3.Connection) -> None:
@@ -1438,20 +1451,26 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     if not rec:
         print("\n最终推荐: (暂无有效预测)")
         return
-    issue_no, main6, special_mom, special_pattern, pool10, pool14, pool20 = rec
+    (issue_no, main6_pattern, main6_ensemble, main6_balanced,
+     special_mom, special_pattern,
+     pool10, pool14, pool20) = rec
     special_mom_text = _fmt_num(special_mom) if special_mom is not None else "--"
     special_pattern_text = _fmt_num(special_pattern) if special_pattern is not None else "--"
-    p6 = " ".join(_fmt_num(n) for n in main6)
+    p6_pattern = " ".join(_fmt_num(n) for n in main6_pattern)
+    p6_ensemble = " ".join(_fmt_num(n) for n in main6_ensemble)
+    p6_balanced = " ".join(_fmt_num(n) for n in main6_balanced)
     p10 = " ".join(_fmt_num(n) for n in pool10)
     p14 = " ".join(_fmt_num(n) for n in pool14)
     p20 = " ".join(_fmt_num(n) for n in pool20)
     print("\n" + "=" * 50)
     print(f"【最终推荐 - 期号 {issue_no}】")
-    print(f"策略说明: 主号采用「冷号回补」(基于最近3期数据)")
-    print(f"  6号池 : {p6}")
-    print(f"  10号池: {p10}")
-    print(f"  14号池: {p14}")
-    print(f"  20号池: {p20}")
+    print(f"策略说明: 主号提供三个候选（规律挖掘、集成投票、组合策略），均基于最近3期数据")
+    print(f"  规律挖掘 6号池 : {p6_pattern}")
+    print(f"  集成投票 6号池 : {p6_ensemble}")
+    print(f"  组合策略 6号池 : {p6_balanced}")
+    print(f"  10号池 (规律挖掘): {p10}")
+    print(f"  14号池 (规律挖掘): {p14}")
+    print(f"  20号池 (规律挖掘): {p20}")
     print(f"特别号候选1 (近期动量): {special_mom_text}")
     print(f"特别号候选2 (规律挖掘): {special_pattern_text}")
     print("=" * 50)
