@@ -1425,6 +1425,25 @@ def print_recommendation_sheet(conn: sqlite3.Connection, limit: int = 8) -> None
         print(f"    20号池: {p20} | 特别号: {special_text}")
 
 
+# ========== 日干支函数（用于玄学，简化版）==========
+def get_day_ganzhi(dt: date) -> Tuple[str, str, str]:
+    """返回 (天干, 地支, 日柱五行) 简化版，基于1900年1月1日"""
+    base = date(1900, 1, 1)
+    days = (dt - base).days
+    gan_list = ["甲", "乙", "丙", "丁", "戊", "己", "庚", "辛", "壬", "癸"]
+    zhi_list = ["子", "丑", "寅", "卯", "辰", "巳", "午", "未", "申", "酉", "戌", "亥"]
+    gan_idx = days % 10
+    zhi_idx = days % 12
+    gan = gan_list[gan_idx]
+    zhi = zhi_list[zhi_idx]
+    gan_wuxing = {
+        "甲": "木", "乙": "木", "丙": "火", "丁": "火", "戊": "土",
+        "己": "土", "庚": "金", "辛": "金", "壬": "水", "癸": "水"
+    }
+    wuxing = gan_wuxing[gan]
+    return gan, zhi, wuxing
+
+
 # ========== 基于得分的生肖预测 ==========
 def get_best_zodiac_by_score(conn: sqlite3.Connection, issue_no: str) -> Tuple[str, float]:
     ensemble_run = conn.execute(
