@@ -5,6 +5,7 @@ import argparse
 import csv
 import io
 import json
+import os
 import re
 import sqlite3
 import time
@@ -51,8 +52,12 @@ ZODIAC_MAP = {
     "猪": [12,24,36,48],
 }
 
-# ========== PushPlus 配置（请自行修改） ==========
-PUSHPLUS_TOKEN = ""   # 填入你的 PushPlus token，留空则不推送
+# ========== PushPlus 配置 ==========
+# 方式1：直接修改下方变量
+PUSHPLUS_TOKEN = ""   # 填入你的 PushPlus token
+# 方式2：设置环境变量 PUSHPLUS_TOKEN（优先级更高）
+if os.environ.get("PUSHPLUS_TOKEN"):
+    PUSHPLUS_TOKEN = os.environ["PUSHPLUS_TOKEN"]
 
 
 @dataclass
@@ -1399,17 +1404,16 @@ def print_recommendation_sheet(conn: sqlite3.Connection, limit: int = 8) -> None
         print(f"    20号池: {p20} | 特别号: {special_text}")
 
 
-# ========== 新增：生肖预测（基于特别号） ==========
+# ========== 生肖预测（基于特别号） ==========
 def get_zodiac_by_number(number: int) -> str:
     for zodiac, nums in ZODIAC_MAP.items():
         if number in nums:
             return zodiac
-    return "鼠"  # fallback
+    return "鼠"
 
 
 def get_predict_zodiac(conn: sqlite3.Connection, issue_no: str) -> Tuple[str, str]:
     """返回预测的生肖及其来源策略"""
-    # 规律挖掘特别号
     pattern_run = conn.execute(
         "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = 'pattern_mined_v1' AND status='PENDING'",
         (issue_no,)
@@ -1418,7 +1422,6 @@ def get_predict_zodiac(conn: sqlite3.Connection, issue_no: str) -> Tuple[str, st
     if pattern_run:
         _, special_pattern = get_picks_for_run(conn, pattern_run["id"])
 
-    # 近期动量特别号
     mom_run = conn.execute(
         "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = 'momentum_v1' AND status='PENDING'",
         (issue_no,)
@@ -1435,9 +1438,8 @@ def get_predict_zodiac(conn: sqlite3.Connection, issue_no: str) -> Tuple[str, st
         return "鼠", "无数据"
 
 
-# ========== 新增：综合投票6码池 ==========
+# ========== 综合投票6码池 ==========
 def get_consensus_main6(conn: sqlite3.Connection, issue_no: str) -> List[int]:
-    """通过多策略投票，返回综合6码池（按票数降序）"""
     vote_count = {n: 0 for n in ALL_NUMBERS}
     for strategy in STRATEGY_IDS:
         run = conn.execute(
@@ -1452,7 +1454,7 @@ def get_consensus_main6(conn: sqlite3.Connection, issue_no: str) -> List[int]:
     return [n for n, _ in sorted_nums[:6]]
 
 
-# ========== 新增：三中三预测（综合6码池+历史共现） ==========
+# ========== 三中三预测（综合6码池+历史共现） ==========
 def get_best_trio_from_consensus(conn: sqlite3.Connection, consensus_main6: List[int]) -> List[int]:
     if len(consensus_main6) < 3:
         return consensus_main6
@@ -1577,7 +1579,6 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
 
 # ========== PushPlus 推送 ==========
 def send_pushplus_notification(title: str, content: str) -> bool:
-    """发送 PushPlus 消息，需要提前配置 PUSHPLUS_TOKEN"""
     if not PUSHPLUS_TOKEN:
         print("[推送] 未配置 PUSHPLUS_TOKEN，跳过推送")
         return False
@@ -1632,7 +1633,7 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
 
     print_final_recommendation(conn)
 
-    # 自动推送（可配置）
+    # 自动推送
     if PUSHPLUS_TOKEN:
         rec = get_final_recommendation(conn)
         if rec:
@@ -1658,8 +1659,8 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
         init_db(conn)
         records = fetch_macau_records()
         total, inserted, updated = sync_from_records(conn, records, source="macau_api")
-        print("自动执行全量历史回测（3期窗口）...")
-        run_historical_backtest(conn, rebuild=True, max_issues=0)
+        print("自动执行全量历史回测（限制最近3期）...")
+        run_historical_backtest(conn, rebuild=True, max_issues=3)
         issue = generate_predictions(conn)
         print(f"Bootstrap done. total={total}, inserted={inserted}, updated={updated}, next_prediction={issue}")
     finally:
@@ -1738,7 +1739,7 @@ def cmd_backtest(args: argparse.Namespace) -> None:
             min_history=args.min_history,
             rebuild=args.rebuild,
             progress_every=args.progress_every,
-            max_issues=args.max_issues if hasattr(args, 'max_issues') else 3,
+            max_issues=args.max_issues,
         )
         print(f"Backtest done. issues={issues}, strategy_runs={runs}, rebuild={args.rebuild}")
         print(f"Mined config: {json.dumps(mined_cfg, ensure_ascii=False)}")
