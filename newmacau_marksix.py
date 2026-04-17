@@ -28,7 +28,6 @@ DB_PATH_DEFAULT = str(SCRIPT_DIR / "newmacau_marksix.db")
 CSV_PATH_DEFAULT = str(SCRIPT_DIR / "NewMacau_Mark_Six.csv")
 MACAU_API_URL = "https://marksix6.net/index.php?api=1"
 
-MINED_CONFIG_KEY = "mined_strategy_config_v1"
 ALL_NUMBERS = list(range(1, 50))
 STRATEGY_LABELS = {
     "balanced_v1": "组合策略",
@@ -85,16 +84,13 @@ def init_db(conn: sqlite3.Connection) -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             issue_no TEXT NOT NULL,
             strategy TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'PENDING',
+            numbers_json TEXT NOT NULL,
+            special_number INTEGER,
+            confidence REAL,
             hit_count INTEGER,
             hit_rate REAL,
-            hit_count_10 INTEGER,
-            hit_rate_10 REAL,
-            hit_count_14 INTEGER,
-            hit_rate_14 REAL,
-            hit_count_20 INTEGER,
-            hit_rate_20 REAL,
             special_hit INTEGER,
+            status TEXT DEFAULT 'PENDING',
             created_at TEXT NOT NULL,
             reviewed_at TEXT,
             UNIQUE(issue_no, strategy)
@@ -128,14 +124,33 @@ def init_db(conn: sqlite3.Connection) -> None:
     _ensure_columns(conn)
     conn.commit()
 
-def _ensure_columns(conn):
-    existing = {r[1] for r in conn.execute("PRAGMA table_info(prediction_picks)").fetchall()}
-    if "pick_type" not in existing:
-        conn.execute("ALTER TABLE prediction_picks ADD COLUMN pick_type TEXT NOT NULL DEFAULT 'MAIN'")
-    existing = {r[1] for r in conn.execute("PRAGMA table_info(prediction_runs)").fetchall()}
-    for col in ["special_hit", "hit_count_10", "hit_rate_10", "hit_count_14", "hit_rate_14", "hit_count_20", "hit_rate_20"]:
+def _ensure_columns(conn: sqlite3.Connection) -> None:
+    # 确保 prediction_runs 表有所有需要的列
+    existing = {col[1] for col in conn.execute("PRAGMA table_info(prediction_runs)").fetchall()}
+    needed = ["numbers_json", "confidence", "hit_count", "hit_rate", "special_hit"]
+    for col in needed:
         if col not in existing:
-            conn.execute(f"ALTER TABLE prediction_runs ADD COLUMN {col} INTEGER" if col.startswith("hit") else f"ALTER TABLE prediction_runs ADD COLUMN {col} REAL")
+            if col == "numbers_json":
+                conn.execute("ALTER TABLE prediction_runs ADD COLUMN numbers_json TEXT")
+            elif col == "confidence":
+                conn.execute("ALTER TABLE prediction_runs ADD COLUMN confidence REAL")
+            elif col == "hit_count":
+                conn.execute("ALTER TABLE prediction_runs ADD COLUMN hit_count INTEGER")
+            elif col == "hit_rate":
+                conn.execute("ALTER TABLE prediction_runs ADD COLUMN hit_rate REAL")
+            elif col == "special_hit":
+                conn.execute("ALTER TABLE prediction_runs ADD COLUMN special_hit INTEGER")
+    # 确保 prediction_picks 有 pick_type
+    existing_picks = {col[1] for col in conn.execute("PRAGMA table_info(prediction_picks)").fetchall()}
+    if "pick_type" not in existing_picks:
+        conn.execute("ALTER TABLE prediction_picks ADD COLUMN pick_type TEXT NOT NULL DEFAULT 'MAIN'")
+    # 确保 prediction_runs 有 hit_count_10, hit_rate_10 等（可选，但为了兼容）
+    for col in ["hit_count_10", "hit_rate_10", "hit_count_14", "hit_rate_14", "hit_count_20", "hit_rate_20"]:
+        if col not in existing:
+            if col.startswith("hit_count"):
+                conn.execute(f"ALTER TABLE prediction_runs ADD COLUMN {col} INTEGER")
+            else:
+                conn.execute(f"ALTER TABLE prediction_runs ADD COLUMN {col} REAL")
 
 # -------------------- 数据获取 --------------------
 def fetch_macau_records() -> List[DrawRecord]:
@@ -181,7 +196,7 @@ def upsert_draw(conn, record, source):
                      (record.draw_date, json.dumps(record.numbers), record.special_number, source, now, record.issue_no))
         return "updated"
     else:
-        conn.execute("INSERT INTO draws VALUES (?,?,?,?,?,?,?)",
+        conn.execute("INSERT INTO draws (issue_no, draw_date, numbers_json, special_number, source, created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
                      (record.issue_no, record.draw_date, json.dumps(record.numbers), record.special_number, source, now, now))
         return "inserted"
 
@@ -274,8 +289,7 @@ def _apply_weight_config(draws, config, reason):
     freq = _normalize(_freq_map(window))
     omission = _normalize({n:1.0/(_omission_map(window)[n]+1) for n in ALL_NUMBERS})
     mom = _normalize(_momentum_map(window))
-    pair = _normalize(calculate_pair_lift(window))
-    zone = _normalize({n: ( ( (n-1)//10 ) ) for n in ALL_NUMBERS})  # 简化，实际可用zone heat
+    # pair lift not used in simple version
     w_freq = config.get("w_freq",0.45)
     w_omit = config.get("w_omit",0.35)
     w_mom = config.get("w_mom",0.20)
@@ -323,8 +337,9 @@ def generate_predictions(conn, issue_no=None):
     if len(draws)<3: raise RuntimeError("需要至少3期数据")
     for strategy in STRATEGY_IDS:
         picks, special, conf, _ = generate_strategy(draws, strategy)
+        main_numbers = [n for n,_,_,_ in picks]
         conn.execute("INSERT OR REPLACE INTO prediction_runs (issue_no, strategy, numbers_json, special_number, confidence, status, created_at) VALUES (?,?,?,?,?,'PENDING',?)",
-                     (target, strategy, json.dumps([n for n,_,_,_ in picks]), special, conf, utc_now()))
+                     (target, strategy, json.dumps(main_numbers), special, conf, utc_now()))
     conn.commit()
     return target
 
@@ -365,19 +380,16 @@ def get_picks_for_run(conn, run_id):
     return mains, specials[0] if specials else None
 
 def _save_prediction_pools(conn, run_id, main6):
-    # 简化：只保存6码池，10/14/20可从score_map扩展，但为了简单，此处只存6
     conn.execute("DELETE FROM prediction_pools WHERE run_id=? AND pool_size=6", (run_id,))
     conn.execute("INSERT INTO prediction_pools (run_id, pool_size, numbers_json, created_at) VALUES (?,?,?,?)",
                  (run_id, 6, json.dumps(main6), utc_now()))
     conn.commit()
 
 def backfill_missing_special_picks(conn):
-    # 简化版本：确保每个PENDING预测都有SPECIAL记录
     runs = conn.execute("SELECT id, strategy FROM prediction_runs WHERE status='PENDING'").fetchall()
     for r in runs:
         existing = conn.execute("SELECT 1 FROM prediction_picks WHERE run_id=? AND pick_type='SPECIAL'", (r["id"],)).fetchone()
         if not existing:
-            # 重新生成该策略的特别号（简单使用该策略的主号池外最高分）
             draws = load_recent_draws(conn, 3)
             _, special, _, _ = generate_strategy(draws, r["strategy"])
             conn.execute("INSERT INTO prediction_picks (run_id, pick_type, number, rank, score, reason) VALUES (?, 'SPECIAL', ?, 1, 0.0, '自动补齐')",
@@ -392,7 +404,6 @@ def print_dashboard(conn):
         print(f"最新开奖: {latest['issue_no']} {latest['draw_date']} | 主号: {nums} | 特别号: {latest['special_number']:02d}")
     else:
         print("暂无开奖数据。")
-    # 显示多策略推荐
     pending = conn.execute("SELECT issue_no, strategy, numbers_json, special_number FROM prediction_runs WHERE status='PENDING' ORDER BY strategy").fetchall()
     if pending:
         print("\n本期多策略推荐:")
@@ -401,7 +412,6 @@ def print_dashboard(conn):
             print(f"  [{p['issue_no']}] {STRATEGY_LABELS.get(p['strategy'], p['strategy'])}: {' '.join(f'{n:02d}' for n in nums)} | 特别号: {p['special_number']:02d}")
     else:
         print("\n暂无待开奖预测，请先运行 predict")
-    # 最终推荐（使用 ensemble 策略）
     ens = conn.execute("SELECT numbers_json, special_number FROM prediction_runs WHERE strategy='ensemble_v2' AND status='PENDING'").fetchone()
     if ens:
         main6 = json.loads(ens["numbers_json"])
@@ -441,13 +451,18 @@ def build_parser():
     p = argparse.ArgumentParser()
     p.add_argument("--db", default=DB_PATH_DEFAULT)
     sub = p.add_subparsers(dest="command", required=True)
-    sub.add_parser("sync").set_defaults(func=cmd_sync)
-    sub.add_parser("predict").set_defaults(func=cmd_predict)
-    sub.add_parser("show").set_defaults(func=cmd_show)
+    p_sync = sub.add_parser("sync")
+    p_sync.set_defaults(func=cmd_sync)
+    p_predict = sub.add_parser("predict")
+    p_predict.add_argument("--issue", help="指定期号")
+    p_predict.set_defaults(func=cmd_predict)
+    p_show = sub.add_parser("show")
+    p_show.set_defaults(func=cmd_show)
     return p
 
 def main():
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
     args.func(args)
 
 if __name__ == "__main__":
