@@ -28,15 +28,15 @@ jobs:
       - name: 首次引导（如果数据库为空）
         run: |
           if [ ! -f newmacau_marksix.db ]; then
-            echo "数据库不存在，开始从 API 引导（全量回测）..."
+            echo "数据库不存在，开始从 API 引导..."
             python newmacau_marksix.py bootstrap
           fi
 
-      - name: 日常同步（只回测最近30期）
+      - name: 日常同步（不回测，只更新数据并生成预测）
         run: |
           if [ -f newmacau_marksix.db ]; then
-            echo "数据库已存在，执行日常同步（回测最近30期）..."
-            python newmacau_marksix.py sync --with-backtest
+            echo "数据库已存在，执行日常同步..."
+            python newmacau_marksix.py sync
           fi
 
       - name: 显示预测推荐
