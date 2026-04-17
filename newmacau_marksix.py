@@ -35,7 +35,7 @@ STRATEGY_LABELS = {
 }
 STRATEGY_IDS = ["balanced_v1", "hot_v1", "cold_rebound_v1", "momentum_v1", "ensemble_v2", "pattern_mined_v1"]
 
-# 生肖映射（用于生肖推荐）
+# 生肖映射
 ZODIAC_MAP = {
     "鼠": [7,19,31,43],
     "牛": [6,18,30,42],
@@ -1396,9 +1396,7 @@ def print_recommendation_sheet(conn: sqlite3.Connection, limit: int = 8) -> None
         print(f"    20号池: {p20} | 特别号: {special_text}")
 
 
-# ========== 新增：获取高命中生肖 ==========
 def get_best_zodiac(conn: sqlite3.Connection, window: int = 3) -> Tuple[str, float]:
-    """返回最近 window 期内命中率最高的生肖及其命中率（基于主号）"""
     draws = get_recent_draws(conn, window)
     if not draws:
         return "龙", 0.0
@@ -1417,9 +1415,7 @@ def get_best_zodiac(conn: sqlite3.Connection, window: int = 3) -> Tuple[str, flo
     return best_zodiac[0], rate
 
 
-# ========== 新增：获取三中三推荐 ==========
 def get_best_trio_from_main6(conn: sqlite3.Connection, main6: List[int]) -> Optional[List[int]]:
-    """从主号6码的前5个号码中，找出历史同时出现频率最高的3码组合"""
     if len(main6) < 5:
         return None
     hot5 = sorted(main6[:5])
@@ -1443,19 +1439,7 @@ def get_best_trio_from_main6(conn: sqlite3.Connection, main6: List[int]) -> Opti
     return list(best_trio)
 
 
-# ========== 最终推荐（包含生肖和三中三）==========
 def get_final_recommendation(conn: sqlite3.Connection) -> Optional[Tuple[str, List[int], List[int], List[int], int, int, List[int], List[int], List[int], str, float, List[int]]]:
-    """
-    获取最终推荐组合：
-    - 主号候选1：规律挖掘的6号池
-    - 主号候选2：集成投票的6号池
-    - 主号候选3：组合策略的6号池
-    - 特别号候选1：近期动量的特别号
-    - 特别号候选2：规律挖掘的特别号
-    - 规律挖掘的10/14/20池
-    - 高命中生肖及命中率
-    - 三中三推荐（基于规律挖掘6号池的前5个号码）
-    """
     row = conn.execute(
         "SELECT issue_no FROM prediction_runs WHERE status='PENDING' ORDER BY created_at DESC LIMIT 1"
     ).fetchone()
@@ -1463,7 +1447,6 @@ def get_final_recommendation(conn: sqlite3.Connection) -> Optional[Tuple[str, Li
         return None
     issue_no = row["issue_no"]
 
-    # 规律挖掘
     pattern_run = conn.execute(
         "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = 'pattern_mined_v1' AND status='PENDING'",
         (issue_no,)
@@ -1476,21 +1459,18 @@ def get_final_recommendation(conn: sqlite3.Connection) -> Optional[Tuple[str, Li
     pool14_pattern = get_pool_numbers_for_run(conn, pattern_id, 14)
     pool20_pattern = get_pool_numbers_for_run(conn, pattern_id, 20)
 
-    # 集成投票
     ensemble_run = conn.execute(
         "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = 'ensemble_v2' AND status='PENDING'",
         (issue_no,)
     ).fetchone()
     main6_ensemble = get_pool_numbers_for_run(conn, ensemble_run["id"], 6) if ensemble_run else []
 
-    # 组合策略
     balanced_run = conn.execute(
         "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = 'balanced_v1' AND status='PENDING'",
         (issue_no,)
     ).fetchone()
     main6_balanced = get_pool_numbers_for_run(conn, balanced_run["id"], 6) if balanced_run else []
 
-    # 特别号候选
     mom_run = conn.execute(
         "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = 'momentum_v1' AND status='PENDING'",
         (issue_no,)
@@ -1503,10 +1483,7 @@ def get_final_recommendation(conn: sqlite3.Connection) -> Optional[Tuple[str, Li
     if pattern_run:
         _, special_pattern = get_picks_for_run(conn, pattern_run["id"])
 
-    # 高命中生肖
     best_zodiac, zodiac_rate = get_best_zodiac(conn, window=3)
-
-    # 三中三推荐
     best_trio = get_best_trio_from_main6(conn, main6_pattern)
 
     if special_momentum is None and special_pattern is None:
