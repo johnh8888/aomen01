@@ -1425,9 +1425,7 @@ def print_recommendation_sheet(conn: sqlite3.Connection, limit: int = 8) -> None
         print(f"    20号池: {p20} | 特别号: {special_text}")
 
 
-# ========== 日干支函数（用于玄学，简化版）==========
 def get_day_ganzhi(dt: date) -> Tuple[str, str, str]:
-    """返回 (天干, 地支, 日柱五行) 简化版，基于1900年1月1日"""
     base = date(1900, 1, 1)
     days = (dt - base).days
     gan_list = ["甲", "乙", "丙", "丁", "戊", "己", "庚", "辛", "壬", "癸"]
@@ -1444,14 +1442,43 @@ def get_day_ganzhi(dt: date) -> Tuple[str, str, str]:
     return gan, zhi, wuxing
 
 
-# ========== 基于得分的生肖预测 ==========
+def ensemble_vote(
+    draws: List[List[int]], specials: List[int], pair_lift: Dict, use_dynamic_weights: bool = True,
+    day_wuxing: str = "", day_zhi: str = ""
+) -> StrategyScore:
+    scores_list = []
+    for s in ["hot_v1", "cold_rebound_v1", "momentum_v1", "balanced_v1", "pattern_mined_v1"]:
+        # 注意：这里的策略ID需要与STRATEGY_IDS中的字符串匹配
+        # 但 generate_strategy 函数期望的是 "hot_v1" 等，而循环中的 s 是 "hot_v1" 等
+        # 我们直接使用 generate_strategy，它会根据 strategy 字符串调用对应的权重配置
+        score_obj = generate_strategy(draws, s, None, pair_lift, use_dynamic_weights, day_wuxing, day_zhi)
+        scores_list.append(score_obj.raw_scores)
+    votes = {n: 0.0 for n in ALL_NUMBERS}
+    for sc in scores_list:
+        ranked = sorted(sc.items(), key=lambda x: x[1], reverse=True)
+        for rank, (n, _) in enumerate(ranked):
+            votes[n] += 49 - rank
+    maxv = max(votes.values())
+    norm_votes = {n: v / maxv for n, v in votes.items()} if maxv else {n: 0.0 for n in ALL_NUMBERS}
+    # 选主号
+    main_picks = _pick_top_six(norm_votes, "集成投票")
+    # 选特别号：从剩下的最高分中取
+    special_candidates = [(n, norm_votes[n]) for n in ALL_NUMBERS if n not in [m for m, _, _, _ in main_picks]]
+    special_pick = max(special_candidates, key=lambda x: x[1])[0] if special_candidates else 1
+    confidence = sum(norm_votes[n] for n, _, _, _ in main_picks) / 6 if main_picks else 0
+    return StrategyScore([n for n, _, _, _ in main_picks], special_pick, confidence, norm_votes)
+
+
+# 需要补充 StrategyScore 类定义（之前已定义过，但为了完整，再定义一次）
+@dataclass
+class StrategyScore:
+    main_picks: List[int]
+    special_pick: int
+    confidence: float
+    raw_scores: Dict[int, float] = field(default_factory=dict)
+
+
 def get_best_zodiac_by_score(conn: sqlite3.Connection, issue_no: str) -> Tuple[str, float]:
-    ensemble_run = conn.execute(
-        "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = 'ensemble_v2' AND status='PENDING'",
-        (issue_no,)
-    ).fetchone()
-    if not ensemble_run:
-        return "龙", 0.0
     draws = load_recent_draws(conn, 3)
     specials = [r[0] for r in conn.execute("SELECT special_number FROM draws ORDER BY draw_date DESC LIMIT 3").fetchall()]
     pair_lift = calculate_pair_lift(draws)
@@ -1474,14 +1501,7 @@ def get_best_zodiac_by_score(conn: sqlite3.Connection, issue_no: str) -> Tuple[s
     return best_zodiac, best_score
 
 
-# ========== 基于得分的三中三推荐 ==========
 def get_best_trio_by_score(conn: sqlite3.Connection, issue_no: str) -> Optional[List[int]]:
-    ensemble_run = conn.execute(
-        "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = 'ensemble_v2' AND status='PENDING'",
-        (issue_no,)
-    ).fetchone()
-    if not ensemble_run:
-        return None
     draws = load_recent_draws(conn, 3)
     specials = [r[0] for r in conn.execute("SELECT special_number FROM draws ORDER BY draw_date DESC LIMIT 3").fetchall()]
     pair_lift = calculate_pair_lift(draws)
