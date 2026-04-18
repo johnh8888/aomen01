@@ -1,13 +1,13 @@
-name: 新澳门彩每日预测
+name: 新澳门彩每日自动更新与推送
 
 on:
   schedule:
-    # 每天北京时间 08:00 运行（UTC 00:00）
-    - cron: '0 0 * * *'
-  workflow_dispatch:   # 允许手动触发
+    # 每天 14:00 UTC（北京时间 22:00），可根据实际开奖时间调整
+    - cron: '0 14 * * *'
+  workflow_dispatch:
 
 jobs:
-  predict:
+  update-predict:
     runs-on: ubuntu-latest
     steps:
       - name: 检出代码
@@ -18,31 +18,30 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: 安装依赖（无额外依赖，标准库即可）
+      - name: 安装依赖（无需额外包）
         run: |
           python -m pip install --upgrade pip
 
-      - name: 配置 PushPlus Token（注入脚本）
-        run: |
-          # 将脚本中的 PUSHPLUS_TOKEN 占位符替换为 GitHub Secrets 中的真实 Token
-          sed -i "s/PUSHPLUS_TOKEN = \"\"/PUSHPLUS_TOKEN = \"${{ secrets.PUSHPLUS_TOKEN }}\"/" newmacau_marksix.py
+      - name: 配置 PushPlus Token
+        run: echo "PUSHPLUS_TOKEN=${{ secrets.PUSHPLUS_TOKEN }}" >> $GITHUB_ENV
 
-      - name: 初始化/同步数据并生成预测
+      - name: 初始化数据库（如果不存在）
         run: |
-          # 如果数据库不存在，则执行 bootstrap；否则执行 sync
           if [ ! -f "newmacau_marksix.db" ]; then
             python newmacau_marksix.py bootstrap
-          else
-            python newmacau_marksix.py sync --with-backtest
           fi
 
-      - name: 显示最终推荐并推送微信
+      - name: 同步最新开奖并生成预测
+        run: |
+          python newmacau_marksix.py sync --with-backtest
+
+      - name: 显示结果并推送微信
         run: |
           python newmacau_marksix.py show
 
       - name: 上传数据库（可选，用于备份）
         uses: actions/upload-artifact@v4
         with:
-          name: newmacau-database
+          name: newmacau-db
           path: newmacau_marksix.db
           retention-days: 7
