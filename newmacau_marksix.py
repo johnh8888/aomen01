@@ -36,26 +36,24 @@ STRATEGY_LABELS = {
 }
 STRATEGY_IDS = ["balanced_v1", "hot_v1", "cold_rebound_v1", "momentum_v1", "ensemble_v2", "pattern_mined_v1"]
 
-# 生肖映射（固定循环：1鼠2牛...12猪，13鼠...）
+# 生肖映射（正确版本：1=马，2=蛇，3=龙，4=兔，5=虎，6=牛，7=鼠，8=猪，9=狗，10=鸡，11=猴，12=羊）
 ZODIAC_MAP = {
-    "鼠": [1,13,25,37,49],
-    "牛": [2,14,26,38],
-    "虎": [3,15,27,39],
-    "兔": [4,16,28,40],
-    "龙": [5,17,29,41],
-    "蛇": [6,18,30,42],
-    "马": [7,19,31,43],
-    "羊": [8,20,32,44],
-    "猴": [9,21,33,45],
-    "鸡": [10,22,34,46],
-    "狗": [11,23,35,47],
-    "猪": [12,24,36,48],
+    "马": [1, 13, 25, 37, 49],
+    "蛇": [2, 14, 26, 38],
+    "龙": [3, 15, 27, 39],
+    "兔": [4, 16, 28, 40],
+    "虎": [5, 17, 29, 41],
+    "牛": [6, 18, 30, 42],
+    "鼠": [7, 19, 31, 43],
+    "猪": [8, 20, 32, 44],
+    "狗": [9, 21, 33, 45],
+    "鸡": [10, 22, 34, 46],
+    "猴": [11, 23, 35, 47],
+    "羊": [12, 24, 36, 48],
 }
 
-# ========== PushPlus 配置 ==========
-# 方式1：直接修改下方变量
-PUSHPLUS_TOKEN = ""   # 填入你的 PushPlus token
-# 方式2：设置环境变量 PUSHPLUS_TOKEN（优先级更高）
+# PushPlus 配置
+PUSHPLUS_TOKEN = ""
 if os.environ.get("PUSHPLUS_TOKEN"):
     PUSHPLUS_TOKEN = os.environ["PUSHPLUS_TOKEN"]
 
@@ -136,6 +134,16 @@ def init_db(conn: sqlite3.Connection) -> None:
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL,
             updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS strategy_performance (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            issue_no TEXT NOT NULL,
+            strategy TEXT NOT NULL,
+            main_hit_count INTEGER NOT NULL,
+            special_hit INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(issue_no, strategy)
         );
         """
     )
@@ -881,6 +889,7 @@ def get_pool_numbers_for_run(conn: sqlite3.Connection, run_id: int, pool_size: i
 def _ensemble_strategy(
     draws: List[List[int]],
     mined_cfg: Optional[Dict[str, float]],
+    strategy_weights: Dict[str, float],
 ) -> Tuple[List[Tuple[int, int, float, str]], int, float, Dict[int, float]]:
     m_hot = _apply_weight_config(draws, {"window": 3.0, "w_freq": 0.8, "w_omit": 0.0, "w_mom": 0.2}, "热号策略")
     m_cold = _apply_weight_config(draws, {"window": 3.0, "w_freq": 0.0, "w_omit": 0.7, "w_mom": 0.3}, "冷号回补")
@@ -894,7 +903,14 @@ def _ensemble_strategy(
 
     score_maps = [m_hot[3], m_cold[3], m_mom[3], m_bal[3], m_mined[3]]
 
-    voted = _rank_vote_score(score_maps)
+    votes = {n: 0.0 for n in ALL_NUMBERS}
+    for idx, (strategy_name, score_map) in enumerate(zip(STRATEGY_IDS, score_maps)):
+        weight = strategy_weights.get(strategy_name, 0.2)
+        ranked = sorted(score_map.items(), key=lambda x: x[1], reverse=True)
+        for rank, (n, _) in enumerate(ranked):
+            votes[n] += weight * (49 - rank)
+    voted = _normalize(votes)
+
     picked = _pick_top_six(voted, "集成投票")
     main_set = {n for n, _, _, _ in picked}
     candidates = [(n, s) for n, s in sorted(voted.items(), key=lambda x: x[1], reverse=True) if n not in main_set]
@@ -908,6 +924,7 @@ def generate_strategy(
     draws: List[List[int]],
     strategy: str,
     mined_config: Optional[Dict[str, float]] = None,
+    strategy_weights: Optional[Dict[str, float]] = None,
 ) -> Tuple[List[Tuple[int, int, float, str]], int, float, Dict[int, float]]:
     if strategy == "hot_v1":
         return _apply_weight_config(draws, {"window": 3.0, "w_freq": 0.8, "w_omit": 0.0, "w_mom": 0.2}, "热号策略")
@@ -916,7 +933,9 @@ def generate_strategy(
     if strategy == "momentum_v1":
         return _apply_weight_config(draws, {"window": 3.0, "w_freq": 0.1, "w_omit": 0.0, "w_mom": 0.9}, "近期动量")
     if strategy == "ensemble_v2":
-        return _ensemble_strategy(draws, mined_config)
+        if strategy_weights is None:
+            strategy_weights = {s: 1.0/len(STRATEGY_IDS) for s in STRATEGY_IDS}
+        return _ensemble_strategy(draws, mined_config, strategy_weights)
     if strategy == "pattern_mined_v1":
         cfg = mined_config or _default_mined_config()
         return _apply_weight_config(draws, cfg, "规律挖掘")
@@ -936,6 +955,8 @@ def generate_predictions(conn: sqlite3.Connection, issue_no: Optional[str] = Non
     if len(draws) < 3:
         raise RuntimeError("Need at least 3 draws to generate predictions.")
     mined_cfg = ensure_mined_pattern_config(conn, force=False)
+
+    strategy_weights = get_strategy_weights(conn, window=3)
 
     for strategy in STRATEGY_IDS:
         now = utc_now()
@@ -968,7 +989,9 @@ def generate_predictions(conn: sqlite3.Connection, issue_no: Optional[str] = Non
             )
             run_id = cur.lastrowid
 
-        picks, special_number, special_score, score_map = generate_strategy(draws, strategy, mined_config=mined_cfg)
+        picks, special_number, special_score, score_map = generate_strategy(
+            draws, strategy, mined_config=mined_cfg, strategy_weights=strategy_weights
+        )
         main_numbers = [n for n, _, _, _ in picks]
         conn.executemany(
             """
@@ -1018,6 +1041,7 @@ def run_historical_backtest(
             WHERE issue_no IN (SELECT issue_no FROM draws)
             """
         )
+        conn.execute("DELETE FROM strategy_performance WHERE issue_no IN (SELECT issue_no FROM draws)")
         conn.commit()
 
     issues_processed = 0
@@ -1145,6 +1169,14 @@ def run_historical_backtest(
                 + [(run_id, "SPECIAL", special_number, 1, special_score, "特别号候选")],
             )
             _save_prediction_pools(conn, run_id, pools)
+
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO strategy_performance(issue_no, strategy, main_hit_count, special_hit, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (issue_no, strategy, hit_count, special_hit, now),
+            )
             runs_processed += 1
 
         issues_processed += 1
@@ -1174,7 +1206,7 @@ def review_issue(conn: sqlite3.Connection, issue_no: str) -> int:
     winning = set(json.loads(draw["numbers_json"]))
     winning_special = int(draw["special_number"])
     runs = conn.execute(
-        "SELECT id FROM prediction_runs WHERE issue_no = ? AND status = 'PENDING'",
+        "SELECT id, strategy FROM prediction_runs WHERE issue_no = ? AND status = 'PENDING'",
         (issue_no,),
     ).fetchall()
     count = 0
@@ -1221,6 +1253,13 @@ def review_issue(conn: sqlite3.Connection, issue_no: str) -> int:
                 utc_now(),
                 run_id,
             ),
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO strategy_performance(issue_no, strategy, main_hit_count, special_hit, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (issue_no, run["strategy"], hit_count, special_hit, utc_now()),
         )
         count += 1
     conn.commit()
@@ -1404,81 +1443,161 @@ def print_recommendation_sheet(conn: sqlite3.Connection, limit: int = 8) -> None
         print(f"    20号池: {p20} | 特别号: {special_text}")
 
 
-# ========== 生肖预测（基于特别号） ==========
+# ========== 动态权重相关函数 ==========
+def get_strategy_weights(conn: sqlite3.Connection, window: int = 3) -> Dict[str, float]:
+    rows = conn.execute("""
+        SELECT strategy, AVG(main_hit_count) as avg_hit
+        FROM strategy_performance
+        WHERE issue_no IN (
+            SELECT issue_no FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT ?
+        )
+        GROUP BY strategy
+    """, (window,)).fetchall()
+    if not rows:
+        return {s: 1.0/len(STRATEGY_IDS) for s in STRATEGY_IDS}
+    weights = {r["strategy"]: max(r["avg_hit"], 0.5) for r in rows}
+    total = sum(weights.values())
+    return {k: v/total for k, v in weights.items()}
+
+
+def get_trio_weights(conn: sqlite3.Connection, window: int = 3) -> Tuple[float, float, float]:
+    rows = conn.execute("""
+        SELECT strategy, AVG(main_hit_count) as avg_hit
+        FROM strategy_performance
+        WHERE strategy IN ('momentum_v1', 'hot_v1', 'cold_rebound_v1')
+        AND issue_no IN (SELECT issue_no FROM draws ORDER BY draw_date DESC LIMIT ?)
+        GROUP BY strategy
+    """, (window,)).fetchall()
+    stats = {r["strategy"]: r["avg_hit"] for r in rows}
+    w_mom = stats.get('momentum_v1', 0.4)
+    w_hot = stats.get('hot_v1', 0.3)
+    w_cold = stats.get('cold_rebound_v1', 0.3)
+    total = w_mom + w_hot + w_cold
+    return w_mom/total, w_hot/total, w_cold/total
+
+
+# ========== 生肖相关函数 ==========
 def get_zodiac_by_number(number: int) -> str:
     for zodiac, nums in ZODIAC_MAP.items():
         if number in nums:
             return zodiac
-    return "鼠"
+    return "马"
 
 
-def get_predict_zodiac(conn: sqlite3.Connection, issue_no: str) -> Tuple[str, str]:
-    """返回预测的生肖及其来源策略"""
-    pattern_run = conn.execute(
-        "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = 'pattern_mined_v1' AND status='PENDING'",
-        (issue_no,)
-    ).fetchone()
-    special_pattern = None
-    if pattern_run:
-        _, special_pattern = get_picks_for_run(conn, pattern_run["id"])
-
-    mom_run = conn.execute(
-        "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = 'momentum_v1' AND status='PENDING'",
-        (issue_no,)
-    ).fetchone()
-    special_momentum = None
-    if mom_run:
-        _, special_momentum = get_picks_for_run(conn, mom_run["id"])
-
-    if special_pattern is not None:
-        return get_zodiac_by_number(special_pattern), "规律挖掘"
-    elif special_momentum is not None:
-        return get_zodiac_by_number(special_momentum), "近期动量"
-    else:
-        return "鼠", "无数据"
+def get_hot_cold_zodiacs(conn: sqlite3.Connection, window: int = 3, top_n: int = 3) -> Tuple[List[str], List[str]]:
+    rows = conn.execute(
+        "SELECT numbers_json, special_number FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT ?",
+        (window,)
+    ).fetchall()
+    if len(rows) < window:
+        default = ["马", "蛇", "龙", "兔", "虎", "牛"]
+        return default[:top_n], default[-top_n:]
+    counter = Counter()
+    for row in rows:
+        numbers = json.loads(row["numbers_json"])
+        for n in numbers:
+            counter[get_zodiac_by_number(n)] += 1
+        special = row["special_number"]
+        counter[get_zodiac_by_number(special)] += 1
+    sorted_by_freq = sorted(counter.items(), key=lambda x: x[1], reverse=True)
+    hot = [z for z, _ in sorted_by_freq[:top_n]]
+    all_zodiacs = list(ZODIAC_MAP.keys())
+    cold_candidates = [(z, counter.get(z, 0)) for z in all_zodiacs]
+    cold_candidates.sort(key=lambda x: x[1])
+    cold = [z for z, _ in cold_candidates[:top_n]]
+    return hot, cold
 
 
-# ========== 综合投票6码池 ==========
-def get_consensus_main6(conn: sqlite3.Connection, issue_no: str) -> List[int]:
-    vote_count = {n: 0 for n in ALL_NUMBERS}
+def get_top_two_zodiac_from_main(conn: sqlite3.Connection, window: int = 3) -> List[str]:
+    rows = conn.execute(
+        "SELECT numbers_json FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT ?",
+        (window,)
+    ).fetchall()
+    if len(rows) < window:
+        return ["马", "蛇"]
+    zodiac_counter = Counter()
+    for row in rows:
+        numbers = json.loads(row["numbers_json"])
+        for n in numbers:
+            zodiac_counter[get_zodiac_by_number(n)] += 1
+    top_two = [z for z, _ in zodiac_counter.most_common(2)]
+    while len(top_two) < 2:
+        top_two.append("马")
+    return top_two
+
+
+# ========== 特别号投票 ==========
+def get_top_special_votes(conn: sqlite3.Connection, issue_no: str, top_n: int = 3) -> List[int]:
+    all_specials = []
     for strategy in STRATEGY_IDS:
         run = conn.execute(
             "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = ? AND status='PENDING'",
             (issue_no, strategy)
         ).fetchone()
         if run:
-            pool6 = get_pool_numbers_for_run(conn, run["id"], 6)
-            for n in pool6:
-                vote_count[n] += 1
-    sorted_nums = sorted(vote_count.items(), key=lambda x: x[1], reverse=True)
-    return [n for n, _ in sorted_nums[:6]]
+            _, sp = get_picks_for_run(conn, run["id"])
+            if sp is not None:
+                all_specials.append(sp)
+    if not all_specials:
+        return []
+    vote_counter = Counter(all_specials)
+    sorted_items = sorted(vote_counter.items(), key=lambda x: (-x[1], x[0]))
+    return [num for num, _ in sorted_items[:top_n]]
 
 
-# ========== 三中三预测（综合6码池+历史共现） ==========
-def get_best_trio_from_consensus(conn: sqlite3.Connection, consensus_main6: List[int]) -> List[int]:
-    if len(consensus_main6) < 3:
-        return consensus_main6
-    rows = conn.execute(
-        "SELECT numbers_json FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT 30"
-    ).fetchall()
-    draws = [json.loads(r[0]) for r in rows]
+# ========== 三中三新逻辑（动态权重） ==========
+def get_merged_pool20(conn: sqlite3.Connection, issue_no: str) -> List[int]:
+    all_numbers = set()
+    for strategy in STRATEGY_IDS:
+        run = conn.execute(
+            "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = ? AND status='PENDING'",
+            (issue_no, strategy)
+        ).fetchone()
+        if run:
+            pool20 = get_pool_numbers_for_run(conn, run["id"], 20)
+            all_numbers.update(pool20)
+    return sorted(all_numbers)
+
+
+def score_numbers_for_trio(conn: sqlite3.Connection, candidate_numbers: List[int]) -> Dict[int, float]:
+    draws = load_recent_draws(conn, 3)
     if len(draws) < 3:
-        return consensus_main6[:3]
-    trios = list(combinations(consensus_main6, 3))
-    if not trios:
-        return consensus_main6[:3]
-    trio_counter = Counter()
-    for trio in trios:
-        trio_counter[trio] = 0
-        for draw in draws:
-            draw_set = set(draw)
-            if all(n in draw_set for n in trio):
-                trio_counter[trio] += 1
-    best_trio = max(trio_counter.items(), key=lambda x: x[1])[0]
-    return list(best_trio)
+        return {n: 0.0 for n in candidate_numbers}
+    momentum = _momentum_map(draws)
+    freq = _freq_map(draws)
+    omission = _omission_map(draws)
+    momentum_norm = _normalize(momentum)
+    freq_norm = _normalize(freq)
+    omission_norm = _normalize(omission)
+    w_mom, w_hot, w_cold = get_trio_weights(conn, window=3)
+    scores = {}
+    for n in candidate_numbers:
+        scores[n] = (w_mom * momentum_norm.get(n, 0) +
+                     w_hot * freq_norm.get(n, 0) +
+                     w_cold * omission_norm.get(n, 0))
+    return scores
 
 
-# ========== 最终推荐汇总 ==========
+def get_trio_from_merged_pool20(conn: sqlite3.Connection, issue_no: str) -> List[int]:
+    merged_pool = get_merged_pool20(conn, issue_no)
+    if len(merged_pool) < 3:
+        return merged_pool[:3] if merged_pool else [1, 2, 3]
+    scores = score_numbers_for_trio(conn, merged_pool)
+    sorted_nums = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    candidates = [n for n, _ in sorted_nums[:10]]
+    def is_valid(trio):
+        odd_cnt = sum(1 for x in trio if x % 2 == 1)
+        return 1 <= odd_cnt <= 2
+    for i in range(len(candidates)):
+        for j in range(i+1, len(candidates)):
+            for k in range(j+1, len(candidates)):
+                trio = (candidates[i], candidates[j], candidates[k])
+                if is_valid(trio):
+                    return list(trio)
+    return [candidates[0], candidates[1], candidates[2]]
+
+
+# ========== 最终推荐函数 ==========
 def get_final_recommendation(conn: sqlite3.Connection):
     row = conn.execute(
         "SELECT issue_no FROM prediction_runs WHERE status='PENDING' ORDER BY created_at DESC LIMIT 1"
@@ -1487,58 +1606,32 @@ def get_final_recommendation(conn: sqlite3.Connection):
         return None
     issue_no = row["issue_no"]
 
-    # 规律挖掘
-    pattern_run = conn.execute(
-        "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = 'pattern_mined_v1' AND status='PENDING'",
+    hot_run = conn.execute(
+        "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = 'hot_v1' AND status='PENDING'",
         (issue_no,)
     ).fetchone()
-    if not pattern_run:
+    if not hot_run:
         return None
-    pattern_id = pattern_run["id"]
-    main6_pattern = get_pool_numbers_for_run(conn, pattern_id, 6)
-    pool10_pattern = get_pool_numbers_for_run(conn, pattern_id, 10)
-    pool14_pattern = get_pool_numbers_for_run(conn, pattern_id, 14)
-    pool20_pattern = get_pool_numbers_for_run(conn, pattern_id, 20)
+    hot_id = hot_run["id"]
+    main6 = get_pool_numbers_for_run(conn, hot_id, 6)
+    pool10 = get_pool_numbers_for_run(conn, hot_id, 10)
+    pool14 = get_pool_numbers_for_run(conn, hot_id, 14)
+    pool20 = get_pool_numbers_for_run(conn, hot_id, 20)
 
-    # 集成投票
-    ensemble_run = conn.execute(
-        "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = 'ensemble_v2' AND status='PENDING'",
-        (issue_no,)
-    ).fetchone()
-    main6_ensemble = get_pool_numbers_for_run(conn, ensemble_run["id"], 6) if ensemble_run else []
-
-    # 组合策略
-    balanced_run = conn.execute(
-        "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = 'balanced_v1' AND status='PENDING'",
-        (issue_no,)
-    ).fetchone()
-    main6_balanced = get_pool_numbers_for_run(conn, balanced_run["id"], 6) if balanced_run else []
-
-    # 特别号候选
     mom_run = conn.execute(
         "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = 'momentum_v1' AND status='PENDING'",
         (issue_no,)
     ).fetchone()
-    special_momentum = None
-    if mom_run:
-        _, special_momentum = get_picks_for_run(conn, mom_run["id"])
-    special_pattern = None
-    if pattern_run:
-        _, special_pattern = get_picks_for_run(conn, pattern_run["id"])
+    if not mom_run:
+        return None
+    mom_id = mom_run["id"]
+    _, special = get_picks_for_run(conn, mom_id)
+    if special is None:
+        return None
 
-    # 生肖预测
-    predict_zodiac, zodiac_source = get_predict_zodiac(conn, issue_no)
+    predict_trio = get_trio_from_merged_pool20(conn, issue_no)
 
-    # 综合6码池
-    consensus_main6 = get_consensus_main6(conn, issue_no)
-
-    # 三中三预测
-    predict_trio = get_best_trio_from_consensus(conn, consensus_main6)
-
-    return (issue_no, main6_pattern, main6_ensemble, main6_balanced,
-            special_momentum, special_pattern,
-            pool10_pattern, pool14_pattern, pool20_pattern,
-            predict_zodiac, zodiac_source, consensus_main6, predict_trio)
+    return (issue_no, main6, special, pool10, pool14, pool20, predict_trio)
 
 
 def print_final_recommendation(conn: sqlite3.Connection) -> None:
@@ -1546,38 +1639,24 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     if not rec:
         print("\n最终推荐: (暂无有效预测)")
         return
-    (issue_no, main6_pattern, main6_ensemble, main6_balanced,
-     special_mom, special_pattern,
-     pool10, pool14, pool20,
-     predict_zodiac, zodiac_source, consensus_main6, predict_trio) = rec
-    special_mom_text = _fmt_num(special_mom) if special_mom is not None else "--"
-    special_pattern_text = _fmt_num(special_pattern) if special_pattern is not None else "--"
-    p6_pattern = " ".join(_fmt_num(n) for n in main6_pattern)
-    p6_ensemble = " ".join(_fmt_num(n) for n in main6_ensemble)
-    p6_balanced = " ".join(_fmt_num(n) for n in main6_balanced)
+    issue_no, main6, special, pool10, pool14, pool20, predict_trio = rec
+    special_text = _fmt_num(special)
+    p6 = " ".join(_fmt_num(n) for n in main6)
     p10 = " ".join(_fmt_num(n) for n in pool10)
     p14 = " ".join(_fmt_num(n) for n in pool14)
     p20 = " ".join(_fmt_num(n) for n in pool20)
-    consensus_str = " ".join(_fmt_num(n) for n in consensus_main6)
     trio_str = " ".join(_fmt_num(n) for n in predict_trio) if predict_trio else "无"
     print("\n" + "=" * 50)
     print(f"【最终推荐 - 期号 {issue_no}】")
-    print(f"策略说明: 主号提供三个候选（规律挖掘、集成投票、组合策略），均基于最近3期数据")
-    print(f"  规律挖掘 6号池 : {p6_pattern}")
-    print(f"  集成投票 6号池 : {p6_ensemble}")
-    print(f"  组合策略 6号池 : {p6_balanced}")
-    print(f"  10号池 (规律挖掘): {p10}")
-    print(f"  14号池 (规律挖掘): {p14}")
-    print(f"  20号池 (规律挖掘): {p20}")
-    print(f"特别号候选1 (近期动量): {special_mom_text}")
-    print(f"特别号候选2 (规律挖掘): {special_pattern_text}")
-    print(f"一肖预测: {predict_zodiac} (基于特别号候选：{zodiac_source})")
-    print(f"综合投票6码池: {consensus_str}")
-    print(f"三中三预测（综合6码池+历史共现）: {trio_str}")
+    print(f"策略说明: 主号采用「热号策略」(基于最近3期数据)，特别号采用「近期动量」")
+    print(f"  6号池 : {p6} | 特别号: {special_text}")
+    print(f"  10号池: {p10} | 特别号: {special_text}")
+    print(f"  14号池: {p14} | 特别号: {special_text}")
+    print(f"  20号池: {p20} | 特别号: {special_text}")
+    print(f"三中三预测（综合20码池+动态权重）: {trio_str}")
     print("=" * 50)
 
 
-# ========== PushPlus 推送 ==========
 def send_pushplus_notification(title: str, content: str) -> bool:
     if not PUSHPLUS_TOKEN:
         print("[推送] 未配置 PUSHPLUS_TOKEN，跳过推送")
@@ -1607,7 +1686,45 @@ def send_pushplus_notification(title: str, content: str) -> bool:
         return False
 
 
-# ========== 仪表盘（含推送） ==========
+def review_latest_prediction(conn: sqlite3.Connection) -> str:
+    """显示最新一期开奖的预测与实际对比"""
+    latest_draw = get_latest_draw(conn)
+    if not latest_draw:
+        return "暂无开奖数据。"
+    issue_no = latest_draw["issue_no"]
+    draw_date = latest_draw["draw_date"]
+    actual_numbers = set(json.loads(latest_draw["numbers_json"]))
+    actual_special = int(latest_draw["special_number"])
+    actual_main_str = " ".join(_fmt_num(n) for n in sorted(actual_numbers))
+    actual_special_str = _fmt_num(actual_special)
+
+    runs = conn.execute(
+        "SELECT id, strategy FROM prediction_runs WHERE issue_no = ? AND status='REVIEWED'",
+        (issue_no,)
+    ).fetchall()
+    if not runs:
+        return f"最新一期 {issue_no} 无预测记录（可能未运行预测）。"
+
+    lines = []
+    lines.append(f"📊 复盘最新一期 {issue_no}（{draw_date}）")
+    lines.append(f"实际开奖: 主号 {actual_main_str}  特别号 {actual_special_str}")
+    lines.append("")
+    lines.append("各策略预测与命中情况：")
+    for run in runs:
+        strategy = run["strategy"]
+        strategy_name = STRATEGY_LABELS.get(strategy, strategy)
+        main6, special = get_picks_for_run(conn, run["id"])
+        if not main6:
+            continue
+        hit_count = len([n for n in main6 if n in actual_numbers])
+        special_hit = 1 if special == actual_special else 0
+        main_str = " ".join(_fmt_num(n) for n in main6)
+        special_str = _fmt_num(special) if special is not None else "--"
+        lines.append(f"  {strategy_name}: 主号 {main_str} | 特别号 {special_str} | 中主号 {hit_count}/6 | 中特别号 {'✅' if special_hit else '❌'}")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def print_dashboard(conn: sqlite3.Connection) -> None:
     latest = get_latest_draw(conn)
     if latest:
@@ -1633,21 +1750,51 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
 
     print_final_recommendation(conn)
 
-    # 自动推送
+    # 复盘最新一期
+    print("\n" + review_latest_prediction(conn))
+
+    # 微信推送
     if PUSHPLUS_TOKEN:
         rec = get_final_recommendation(conn)
         if rec:
-            (issue_no, _, _, _, special_mom, special_pattern, _, _, _,
-             predict_zodiac, _, _, predict_trio) = rec
-            special_mom_text = _fmt_num(special_mom) if special_mom else "无"
-            special_pattern_text = _fmt_num(special_pattern) if special_pattern else "无"
+            issue_no, main6, special, _, _, _, predict_trio = rec
+            special_text = _fmt_num(special)
             trio_str = " ".join(_fmt_num(n) for n in predict_trio) if predict_trio else "无"
+
+            all_specials = []
+            for strategy in STRATEGY_IDS:
+                run = conn.execute(
+                    "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = ? AND status='PENDING'",
+                    (issue_no, strategy)
+                ).fetchone()
+                if run:
+                    _, sp = get_picks_for_run(conn, run["id"])
+                    if sp is not None:
+                        all_specials.append(sp)
+            unique_specials = []
+            for sp in all_specials:
+                if sp not in unique_specials:
+                    unique_specials.append(sp)
+            all_specials_str = " ".join(_fmt_num(n) for n in unique_specials) if unique_specials else "无"
+
+            top_special_votes = get_top_special_votes(conn, issue_no, top_n=3)
+            top_special_str = " ".join(_fmt_num(n) for n in top_special_votes) if top_special_votes else "无"
+
+            hot, cold = get_hot_cold_zodiacs(conn, window=3, top_n=3)
+            if len(hot) >= 2 and len(cold) >= 1:
+                combo = hot[:2] + [cold[0]]
+                combo_str = "、".join(combo)
+            else:
+                combo_str = "数据不足"
+
             content = (
                 f"【新澳门·{issue_no}期推荐】\n"
-                f"🐉 一肖预测：{predict_zodiac}\n"
-                f"🔮 特别号候选：{special_mom_text} / {special_pattern_text}\n"
-                f"🏆 三中三预测：{trio_str}\n"
-                f"📊 详情请运行 python script.py show"
+                f"🎯 2热+1冷生肖组合（最近3期）：{combo_str}\n"
+                f"🔮 特别号（动量策略参考）：{special_text}\n"
+                f"📊 特别号综合汇总（各策略去重）：{all_specials_str}\n"
+                f"⭐ 最终投票特别号（前三热门）：{top_special_str}\n"
+                f"🏆 三中三预测（综合20码池+动态权重）：{trio_str}\n"
+                f"📊 详情请运行 python newmacau_marksix.py show"
             )
             send_pushplus_notification(f"新澳门预测 {issue_no}", content)
 
@@ -1659,7 +1806,7 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
         init_db(conn)
         records = fetch_macau_records()
         total, inserted, updated = sync_from_records(conn, records, source="macau_api")
-        print("自动执行全量历史回测（限制最近3期）...")
+        print("自动执行轻量回测（最近3期）...")
         run_historical_backtest(conn, rebuild=True, max_issues=3)
         issue = generate_predictions(conn)
         print(f"Bootstrap done. total={total}, inserted={inserted}, updated={updated}, next_prediction={issue}")
@@ -1739,7 +1886,7 @@ def cmd_backtest(args: argparse.Namespace) -> None:
             min_history=args.min_history,
             rebuild=args.rebuild,
             progress_every=args.progress_every,
-            max_issues=args.max_issues,
+            max_issues=args.max_issues if hasattr(args, 'max_issues') else 3,
         )
         print(f"Backtest done. issues={issues}, strategy_runs={runs}, rebuild={args.rebuild}")
         print(f"Mined config: {json.dumps(mined_cfg, ensure_ascii=False)}")
@@ -1758,7 +1905,7 @@ def cmd_mine(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="澳门六合彩预测工具 - 基于最近3期数据，含生肖和三中三预测")
+    p = argparse.ArgumentParser(description="新澳门六合彩预测工具 - 动态权重 + 三中三 + 生肖推荐")
     p.add_argument("--db", default=DB_PATH_DEFAULT, help=f"SQLite db path (default: {DB_PATH_DEFAULT})")
     p.add_argument("--update", action="store_true", help="Quick sync (same as sync)")
     p.add_argument("--update-csv", default=CSV_PATH_DEFAULT, help=f"CSV path used with --update (default: {CSV_PATH_DEFAULT})")
