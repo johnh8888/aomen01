@@ -1699,6 +1699,44 @@ def _select_zodiac_triplet_from_scores(zodiac_scores: Dict[str, float]) -> List[
     return best_triplet
 
 
+def _select_single_zodiac_from_scores(zodiac_scores: Dict[str, float]) -> str:
+    ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
+    return ranked[0][0] if ranked else "马"
+
+
+def get_single_zodiac_pick(conn: sqlite3.Connection, issue_no: str, window: int = 24) -> str:
+    rows = conn.execute(
+        "SELECT numbers_json, special_number FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT ?",
+        (window,),
+    ).fetchall()
+    if not rows:
+        return "马"
+    zodiac_scores = _build_zodiac_scores_from_rows(rows)
+    _, _, _, pool20, _ = _weighted_consensus_pools(conn, issue_no)
+    if pool20:
+        for idx, n in enumerate(pool20):
+            boost = (20 - idx) / 20.0
+            zodiac_scores[get_zodiac_by_number(int(n))] += 1.0 * boost
+    return _select_single_zodiac_from_scores(zodiac_scores)
+
+
+def get_two_zodiac_picks(conn: sqlite3.Connection, issue_no: str, window: int = 24) -> List[str]:
+    rows = conn.execute(
+        "SELECT numbers_json, special_number FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT ?",
+        (window,),
+    ).fetchall()
+    if not rows:
+        return ["马", "蛇"]
+    zodiac_scores = _build_zodiac_scores_from_rows(rows)
+    _, _, _, pool20, _ = _weighted_consensus_pools(conn, issue_no)
+    if pool20:
+        for idx, n in enumerate(pool20):
+            boost = (20 - idx) / 20.0
+            zodiac_scores[get_zodiac_by_number(int(n))] += 0.9 * boost
+    ranked = [z for z, _ in sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))]
+    return ranked[:2] if len(ranked) >= 2 else ["马", "蛇"]
+
+
 def get_recent_zodiac_triplet_report(
     conn: sqlite3.Connection,
     lookback: int = 20,
@@ -1756,6 +1794,102 @@ def get_recent_zodiac_triplet_report(
         "avg_hit": float(sum(hit_counts) / samples),
         "max_miss_streak": float(max_miss_streak),
     }
+
+
+def get_recent_single_zodiac_report(
+    conn: sqlite3.Connection,
+    lookback: int = 20,
+    history_window: int = 24,
+) -> Dict[str, float]:
+    rows = _draws_ordered_asc(conn)
+    if len(rows) < history_window + 1:
+        return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
+
+    start = max(history_window, len(rows) - lookback)
+    hits = 0
+    samples = 0
+    miss_streak = 0
+    max_miss_streak = 0
+    for i in range(start, len(rows)):
+        history_rows = rows[max(0, i - history_window):i]
+        if len(history_rows) < history_window:
+            continue
+        zodiac_scores = _build_zodiac_scores_from_rows(list(reversed(history_rows)))
+        pick = _select_single_zodiac_from_scores(zodiac_scores)
+        win_main = json.loads(rows[i]["numbers_json"])
+        win_special = int(rows[i]["special_number"])
+        winning_zodiacs = {get_zodiac_by_number(int(n)) for n in win_main}
+        winning_zodiacs.add(get_zodiac_by_number(win_special))
+        hit = 1 if pick in winning_zodiacs else 0
+        hits += hit
+        samples += 1
+        if hit == 0:
+            miss_streak += 1
+            max_miss_streak = max(max_miss_streak, miss_streak)
+        else:
+            miss_streak = 0
+
+    if samples == 0:
+        return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
+    return {
+        "samples": float(samples),
+        "hit_rate": float(hits / samples),
+        "max_miss_streak": float(max_miss_streak),
+    }
+
+
+def get_recent_two_zodiac_report(
+    conn: sqlite3.Connection,
+    lookback: int = 20,
+    history_window: int = 24,
+) -> Dict[str, float]:
+    rows = _draws_ordered_asc(conn)
+    if len(rows) < history_window + 1:
+        return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
+
+    start = max(history_window, len(rows) - lookback)
+    hits = 0
+    samples = 0
+    miss_streak = 0
+    max_miss_streak = 0
+    for i in range(start, len(rows)):
+        history_rows = rows[max(0, i - history_window):i]
+        if len(history_rows) < history_window:
+            continue
+        zodiac_scores = _build_zodiac_scores_from_rows(list(reversed(history_rows)))
+        ranked = [z for z, _ in sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))]
+        picks = ranked[:2]
+        win_main = json.loads(rows[i]["numbers_json"])
+        win_special = int(rows[i]["special_number"])
+        winning_zodiacs = {get_zodiac_by_number(int(n)) for n in win_main}
+        winning_zodiacs.add(get_zodiac_by_number(win_special))
+        hit = 1 if any(z in winning_zodiacs for z in picks) else 0
+        hits += hit
+        samples += 1
+        if hit == 0:
+            miss_streak += 1
+            max_miss_streak = max(max_miss_streak, miss_streak)
+        else:
+            miss_streak = 0
+
+    if samples == 0:
+        return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
+    return {
+        "samples": float(samples),
+        "hit_rate": float(hits / samples),
+        "max_miss_streak": float(max_miss_streak),
+    }
+
+
+def choose_zodiac_strategy_mode(conn: sqlite3.Connection) -> str:
+    triplet_report = get_recent_zodiac_triplet_report(conn, lookback=20, history_window=24)
+    two_hit_rate = float(triplet_report.get("two_hit_rate", 0.0))
+    samples = int(triplet_report.get("samples", 0.0))
+    if samples < 12:
+        return "single"
+    if two_hit_rate < 0.45:
+        return "single"
+    return "triplet"
 
 
 def get_top_two_zodiac_from_main(conn: sqlite3.Connection, window: int = 3) -> List[str]:
@@ -1943,8 +2077,24 @@ def get_final_recommendation(conn: sqlite3.Connection):
 
     predict_trio = get_trio_from_merged_pool20(conn, issue_no)
 
-    zodiac_combo = get_zodiac_triplet_for_two_hits(conn, issue_no, window=24)
-    return (issue_no, main6, special, pool10, pool14, pool20, predict_trio, special_defenses, special_conflict, zodiac_combo)
+    zodiac_mode = choose_zodiac_strategy_mode(conn)
+    if zodiac_mode == "triplet":
+        zodiac_selection: Sequence[str] = get_zodiac_triplet_for_two_hits(conn, issue_no, window=24)
+    else:
+        zodiac_selection = [get_single_zodiac_pick(conn, issue_no, window=24)]
+    return (
+        issue_no,
+        main6,
+        special,
+        pool10,
+        pool14,
+        pool20,
+        predict_trio,
+        special_defenses,
+        special_conflict,
+        list(zodiac_selection),
+        zodiac_mode,
+    )
 
 
 def print_final_recommendation(conn: sqlite3.Connection) -> None:
@@ -1952,7 +2102,7 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     if not rec:
         print("\n最终推荐: (暂无有效预测)")
         return
-    issue_no, main6, special, pool10, pool14, pool20, predict_trio, special_defenses, special_conflict, zodiac_combo = rec
+    issue_no, main6, special, pool10, pool14, pool20, predict_trio, special_defenses, special_conflict, zodiac_selection, zodiac_mode = rec
     special_text = _fmt_num(special)
     p6 = " ".join(_fmt_num(n) for n in main6)
     p10 = " ".join(_fmt_num(n) for n in pool10)
@@ -1960,7 +2110,7 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     p20 = " ".join(_fmt_num(n) for n in pool20)
     trio_str = " ".join(_fmt_num(n) for n in predict_trio) if predict_trio else "无"
 
-    combo_str = "、".join(zodiac_combo) if zodiac_combo else "数据不足"
+    zodiac_text = "、".join(zodiac_selection) if zodiac_selection else "数据不足"
     defense_text = " ".join(_fmt_num(n) for n in special_defenses) if special_defenses else "无"
 
     print("\n" + "=" * 50)
@@ -1974,7 +2124,10 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     if special_conflict:
         print("特别号提示: 主推候选与主号冲突，已自动切换到非冲突号码")
     print(f"三中三预测（综合20码池+动态权重）: {trio_str}")
-    print(f"🎯 三生肖（目标每期命中2只）: {combo_str}")
+    if zodiac_mode == "triplet":
+        print(f"🎯 三生肖推荐（2中主策略）: {zodiac_text}")
+    else:
+        print(f"🎯 单生肖推荐（1中风控模式）: {zodiac_text}")
     print("=" * 50)
 
 
@@ -2086,13 +2239,11 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
             f"近1中率={hit1:.1f}% 近2中率={hit2:.1f}% 连挂={cold} 当前权重={weight:.1f}%"
         )
 
-    zodiac_report = get_recent_zodiac_triplet_report(conn, lookback=20, history_window=24)
-    print("\n三生肖复盘（目标每期中2只）:")
+    zodiac_report = get_recent_single_zodiac_report(conn, lookback=20, history_window=24)
+    print("\n单生肖复盘（最近20期）:")
     print(
         f"  - 最近样本={int(zodiac_report['samples'])}期 "
-        f"2中率={zodiac_report['two_hit_rate'] * 100:.1f}% "
-        f"1中率={zodiac_report['one_hit_rate'] * 100:.1f}% "
-        f"平均命中={zodiac_report['avg_hit']:.2f} "
+        f"命中率={zodiac_report['hit_rate'] * 100:.1f}% "
         f"最大连空={int(zodiac_report['max_miss_streak'])}"
     )
 
@@ -2105,7 +2256,7 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
     if PUSHPLUS_TOKEN:
         rec = get_final_recommendation(conn)
         if rec:
-            issue_no, main6, special, _, _, _, predict_trio, special_defenses, special_conflict, zodiac_combo = rec
+            issue_no, main6, special, _, _, _, predict_trio, special_defenses, special_conflict, zodiac_pick = rec
             special_text = _fmt_num(special)
             trio_str = " ".join(_fmt_num(n) for n in predict_trio) if predict_trio else "无"
             defense_text = " ".join(_fmt_num(n) for n in special_defenses) if special_defenses else "无"
@@ -2129,12 +2280,12 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
             top_special_votes = get_top_special_votes(conn, issue_no, top_n=3)
             top_special_str = " ".join(_fmt_num(n) for n in top_special_votes) if top_special_votes else "无"
 
-            combo_str = "、".join(zodiac_combo) if zodiac_combo else "数据不足"
+            zodiac_text = zodiac_pick if zodiac_pick else "数据不足"
             conflict_tip = "（已避开主号冲突）" if special_conflict else ""
 
             content = (
                 f"【新澳门·{issue_no}期推荐】\n"
-                f"🎯 三生肖（目标每期命中2只）：{combo_str}\n"
+                f"🎯 单生肖推荐：{zodiac_text}\n"
                 f"🔮 特别号主推：{special_text}{conflict_tip}\n"
                 f"🛡 特别号防守：{defense_text}\n"
                 f"📊 特别号综合汇总（各策略去重）：{all_specials_str}\n"
