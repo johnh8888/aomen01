@@ -1649,6 +1649,115 @@ def get_hot_cold_zodiacs(conn: sqlite3.Connection, window: int = 12, top_n: int 
     return hot, cold
 
 
+def get_zodiac_triplet_for_two_hits(conn: sqlite3.Connection, issue_no: str, window: int = 24) -> List[str]:
+    rows = conn.execute(
+        "SELECT numbers_json, special_number FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT ?",
+        (window,),
+    ).fetchall()
+    if not rows:
+        return ["马", "蛇", "龙"]
+
+    zodiac_scores = _build_zodiac_scores_from_rows(rows)
+
+    # 用当期共识号池给生肖额外加分，让推荐和当前号池保持一致
+    _, _, _, pool20, _ = _weighted_consensus_pools(conn, issue_no)
+    if pool20:
+        for idx, n in enumerate(pool20):
+            boost = (20 - idx) / 20.0
+            zodiac_scores[get_zodiac_by_number(int(n))] += 0.8 * boost
+
+    return _select_zodiac_triplet_from_scores(zodiac_scores)
+
+
+def _build_zodiac_scores_from_rows(rows: Sequence[sqlite3.Row]) -> Dict[str, float]:
+    zodiac_scores: Dict[str, float] = {z: 0.0 for z in ZODIAC_MAP.keys()}
+    for idx, row in enumerate(rows):
+        recency_w = 1.0 / (1.0 + idx * 0.25)
+        numbers = json.loads(row["numbers_json"])
+        for n in numbers:
+            zodiac_scores[get_zodiac_by_number(int(n))] += 1.0 * recency_w
+        zodiac_scores[get_zodiac_by_number(int(row["special_number"]))] += 1.15 * recency_w
+    return zodiac_scores
+
+
+def _select_zodiac_triplet_from_scores(zodiac_scores: Dict[str, float]) -> List[str]:
+    all_zodiacs = list(ZODIAC_MAP.keys())
+    best_triplet = ["马", "蛇", "龙"]
+    best_obj = -1e9
+    for a, b, c in combinations(all_zodiacs, 3):
+        trio = [a, b, c]
+        vals = [zodiac_scores[z] for z in trio]
+        total = sum(vals)
+        mn = min(vals)
+        mx = max(vals)
+        spread_penalty = (mx - mn) * 0.35
+        # 目标“2中”更怕两弱一强，所以提高最弱项占比
+        obj = total + mn * 0.9 - spread_penalty
+        if obj > best_obj:
+            best_obj = obj
+            best_triplet = trio
+    return best_triplet
+
+
+def get_recent_zodiac_triplet_report(
+    conn: sqlite3.Connection,
+    lookback: int = 20,
+    history_window: int = 24,
+) -> Dict[str, float]:
+    rows = _draws_ordered_asc(conn)
+    if len(rows) < history_window + 1:
+        return {
+            "samples": 0.0,
+            "two_hit_rate": 0.0,
+            "one_hit_rate": 0.0,
+            "avg_hit": 0.0,
+            "max_miss_streak": 0.0,
+        }
+
+    start = max(history_window, len(rows) - lookback)
+    hit_counts: List[int] = []
+    miss_streak = 0
+    max_miss_streak = 0
+
+    for i in range(start, len(rows)):
+        history_rows = rows[max(0, i - history_window):i]
+        if len(history_rows) < history_window:
+            continue
+        zodiac_scores = _build_zodiac_scores_from_rows(list(reversed(history_rows)))
+        triplet = _select_zodiac_triplet_from_scores(zodiac_scores)
+
+        win_main = json.loads(rows[i]["numbers_json"])
+        win_special = int(rows[i]["special_number"])
+        winning_zodiacs = {get_zodiac_by_number(int(n)) for n in win_main}
+        winning_zodiacs.add(get_zodiac_by_number(win_special))
+        hit = len([z for z in triplet if z in winning_zodiacs])
+        hit_counts.append(hit)
+
+        if hit == 0:
+            miss_streak += 1
+            max_miss_streak = max(max_miss_streak, miss_streak)
+        else:
+            miss_streak = 0
+
+    if not hit_counts:
+        return {
+            "samples": 0.0,
+            "two_hit_rate": 0.0,
+            "one_hit_rate": 0.0,
+            "avg_hit": 0.0,
+            "max_miss_streak": 0.0,
+        }
+
+    samples = len(hit_counts)
+    return {
+        "samples": float(samples),
+        "two_hit_rate": float(sum(1 for x in hit_counts if x >= 2) / samples),
+        "one_hit_rate": float(sum(1 for x in hit_counts if x >= 1) / samples),
+        "avg_hit": float(sum(hit_counts) / samples),
+        "max_miss_streak": float(max_miss_streak),
+    }
+
+
 def get_top_two_zodiac_from_main(conn: sqlite3.Connection, window: int = 3) -> List[str]:
     rows = conn.execute(
         "SELECT numbers_json FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT ?",
@@ -1834,10 +1943,7 @@ def get_final_recommendation(conn: sqlite3.Connection):
 
     predict_trio = get_trio_from_merged_pool20(conn, issue_no)
 
-    hot, cold = get_hot_cold_zodiacs(conn, window=12, top_n=4)
-    zodiac_combo = []
-    if len(hot) >= 2 and len(cold) >= 1:
-        zodiac_combo = [hot[0], hot[1], cold[0]]
+    zodiac_combo = get_zodiac_triplet_for_two_hits(conn, issue_no, window=24)
     return (issue_no, main6, special, pool10, pool14, pool20, predict_trio, special_defenses, special_conflict, zodiac_combo)
 
 
@@ -1868,7 +1974,7 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     if special_conflict:
         print("特别号提示: 主推候选与主号冲突，已自动切换到非冲突号码")
     print(f"三中三预测（综合20码池+动态权重）: {trio_str}")
-    print(f"🎯 2热+1冷生肖组合（最近12期加权）: {combo_str}")
+    print(f"🎯 三生肖（目标每期命中2只）: {combo_str}")
     print("=" * 50)
 
 
@@ -1980,6 +2086,16 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
             f"近1中率={hit1:.1f}% 近2中率={hit2:.1f}% 连挂={cold} 当前权重={weight:.1f}%"
         )
 
+    zodiac_report = get_recent_zodiac_triplet_report(conn, lookback=20, history_window=24)
+    print("\n三生肖复盘（目标每期中2只）:")
+    print(
+        f"  - 最近样本={int(zodiac_report['samples'])}期 "
+        f"2中率={zodiac_report['two_hit_rate'] * 100:.1f}% "
+        f"1中率={zodiac_report['one_hit_rate'] * 100:.1f}% "
+        f"平均命中={zodiac_report['avg_hit']:.2f} "
+        f"最大连空={int(zodiac_report['max_miss_streak'])}"
+    )
+
     print_final_recommendation(conn)
 
     # 复盘最新一期
@@ -2018,7 +2134,7 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
 
             content = (
                 f"【新澳门·{issue_no}期推荐】\n"
-                f"🎯 2热+1冷生肖组合（最近12期加权）：{combo_str}\n"
+                f"🎯 三生肖（目标每期命中2只）：{combo_str}\n"
                 f"🔮 特别号主推：{special_text}{conflict_tip}\n"
                 f"🛡 特别号防守：{defense_text}\n"
                 f"📊 特别号综合汇总（各策略去重）：{all_specials_str}\n"
