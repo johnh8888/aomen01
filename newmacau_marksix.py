@@ -32,8 +32,6 @@ API_RETRY_BACKOFF_SECONDS = 2.0
 MINED_CONFIG_KEY = "mined_strategy_config_v1"
 ALL_NUMBERS = list(range(1, 50))
 
-# ==================== 窗口优化配置（已完成） ====================
-FEATURE_WINDOW_DEFAULT = 10          # 全局后备窗口
 
 # ==================== 【优化后常量 - 请替换】 ====================
 FEATURE_WINDOW_DEFAULT = 10
@@ -54,10 +52,7 @@ BACKTEST_ISSUES_DEFAULT = 120
 # Ensemble v3.1 配置
 ENSEMBLE_DIVERSITY_BONUS = 0.13
 
-# 多策略集成优化配置
-ENSEMBLE_VERSION = "v3"   # 可切换 v2 / v3 测试
-ENSEMBLE_DIVERSITY_BONUS = 0.12   # 多样性奖励强度（0.08~0.15 之间）
-ENSEMBLE_RECENT_DECAY = 0.75      # 近期表现衰减系数
+
 
 # 策略基础窗口（用于自适应调整）
 STRATEGY_BASE_WINDOWS = {
