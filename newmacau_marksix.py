@@ -32,7 +32,6 @@ API_RETRY_BACKOFF_SECONDS = 2.0
 MINED_CONFIG_KEY = "mined_strategy_config_v1"
 ALL_NUMBERS = list(range(1, 50))
 
-
 # ==================== 【优化后常量 - 请替换】 ====================
 FEATURE_WINDOW_DEFAULT = 10
 
@@ -51,21 +50,6 @@ BACKTEST_ISSUES_DEFAULT = 120
 
 # Ensemble v3.1 配置
 ENSEMBLE_DIVERSITY_BONUS = 0.13
-
-
-
-# 策略基础窗口（用于自适应调整）
-STRATEGY_BASE_WINDOWS = {
-    "hot_v1": 6,
-    "momentum_v1": 7,
-    "cold_rebound_v1": 13,
-    "balanced_v1": 10,
-    "pattern_mined_v1": 10,
-}
-
-WEIGHT_WINDOW_DEFAULT = 30           # 策略权重窗口（保持不变）
-HEALTH_WINDOW_DEFAULT = 18           # 健康度检查窗口
-BACKTEST_ISSUES_DEFAULT = 120        # 回测范围可适当加大
 
 STRATEGY_LABELS = {
     "balanced_v1": "组合策略",
@@ -978,6 +962,52 @@ def get_adaptive_strategy_window(strategy: str, conn: sqlite3.Connection) -> int
     return base
 
 
+def _generate_special_number_v2(
+    conn: sqlite3.Connection,
+    main_pool: List[int],
+    issue_no: str
+) -> Tuple[int, float, List[int]]:
+    """特别号独立模型 v2"""
+    special_votes = []
+    for strategy in STRATEGY_IDS:
+        run = conn.execute(
+            "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = ? AND status='PENDING'",
+            (issue_no, strategy)
+        ).fetchone()
+        if run:
+            _, sp = get_picks_for_run(conn, run["id"])
+            if sp is not None:
+                special_votes.append(sp)
+
+    vote_counter = Counter(special_votes)
+
+    # 历史遗漏
+    recent_specials = [int(r["special_number"]) for r in conn.execute(
+        "SELECT special_number FROM draws ORDER BY draw_date DESC LIMIT 60"
+    ).fetchall()]
+    
+    omission = {n: 40 for n in ALL_NUMBERS}
+    for i, num in enumerate(recent_specials):
+        omission[num] = min(omission.get(num, 40), i + 1)
+
+    scores = {}
+    main_set = set(main_pool)
+    for n in ALL_NUMBERS:
+        if n in main_set:
+            continue
+        score = vote_counter.get(n, 0) * 3.0
+        score += (40 - omission.get(n, 40)) * 0.65
+        score += (1 / (1 + omission.get(n, 40))) * 1.8
+        scores[n] = score
+
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    best = ranked[0][0]
+    confidence = min(1.0, ranked[0][1] / 12)
+    defenses = [n for n, _ in ranked[1:3]]
+
+    return best, round(confidence, 3), defenses
+
+
 def _ensemble_strategy_v3_1(
     draws: List[List[int]],
     mined_config: Optional[Dict[str, float]],
@@ -1033,50 +1063,6 @@ def _ensemble_strategy_v3_1(
 
     return main_picked, special_number, confidence, voted
 
-def _generate_special_number_v2(
-    conn: sqlite3.Connection,
-    main_pool: List[int],
-    issue_no: str
-) -> Tuple[int, float, List[int]]:
-    """特别号独立模型 v2"""
-    special_votes = []
-    for strategy in STRATEGY_IDS:
-        run = conn.execute(
-            "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = ? AND status='PENDING'",
-            (issue_no, strategy)
-        ).fetchone()
-        if run:
-            _, sp = get_picks_for_run(conn, run["id"])
-            if sp is not None:
-                special_votes.append(sp)
-
-    vote_counter = Counter(special_votes)
-
-    # 历史遗漏
-    recent_specials = [int(r["special_number"]) for r in conn.execute(
-        "SELECT special_number FROM draws ORDER BY draw_date DESC LIMIT 60"
-    ).fetchall()]
-    
-    omission = {n: 40 for n in ALL_NUMBERS}
-    for i, num in enumerate(recent_specials):
-        omission[num] = min(omission.get(num, 40), i + 1)
-
-    scores = {}
-    main_set = set(main_pool)
-    for n in ALL_NUMBERS:
-        if n in main_set:
-            continue
-        score = vote_counter.get(n, 0) * 3.0
-        score += (40 - omission.get(n, 40)) * 0.65
-        score += (1 / (1 + omission.get(n, 40))) * 1.8
-        scores[n] = score
-
-    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-    best = ranked[0][0]
-    confidence = min(1.0, ranked[0][1] / 12)
-    defenses = [n for n, _ in ranked[1:3]]
-
-    return best, round(confidence, 3), defenses
 
 def generate_strategy(
     draws: List[List[int]],
@@ -1084,10 +1070,11 @@ def generate_strategy(
     mined_config: Optional[Dict[str, float]] = None,
     strategy_weights: Optional[Dict[str, float]] = None,
     conn: Optional[sqlite3.Connection] = None,
+    issue_no: Optional[str] = None,
 ) -> Tuple[List[Tuple[int, int, float, str]], int, float, Dict[int, float]]:
     
     # === 策略专用窗口（核心优化点）===
-    window_size = STRATEGY_WINDOWS.get(strategy, FEATURE_WINDOW_DEFAULT)
+    window_size = STRATEGY_BASE_WINDOWS.get(strategy, FEATURE_WINDOW_DEFAULT)
     
     # 确保窗口不超过可用历史
     strategy_draws = draws[:window_size] if len(draws) > window_size else draws
@@ -1129,16 +1116,17 @@ def generate_strategy(
     
     elif strategy == "pattern_mined_v1":
         cfg = mined_config or _default_mined_config()
-        cfg["window"] = float(window_size)          # 让规律挖掘也使用优化窗口
+        cfg["window"] = float(window_size)
         return _apply_weight_config(strategy_draws, cfg, "规律挖掘")
     
     elif strategy == "ensemble_v2" or strategy == "ensemble_v3":
         if strategy_weights is None:
             strategy_weights = get_strategy_weights(conn, window=WEIGHT_WINDOW_DEFAULT) if conn else {s: 1.0/len(STRATEGY_IDS) for s in STRATEGY_IDS}
         if conn is None:
-            # 降级方案：无数据库连接时使用基础集成
             raise ValueError("ensemble_v2/v3 requires database connection")
-        return _ensemble_strategy_v3(strategy_draws, mined_config, strategy_weights, conn)
+        if issue_no is None:
+            raise ValueError("ensemble_v2/v3 requires issue_no parameter")
+        return _ensemble_strategy_v3_1(strategy_draws, mined_config, strategy_weights, conn, issue_no)
     
     # 默认 fallback
     return _apply_weight_config(
@@ -1199,7 +1187,7 @@ def generate_predictions(conn: sqlite3.Connection, issue_no: Optional[str] = Non
             run_id = cur.lastrowid
 
         picks, special_number, special_score, score_map = generate_strategy(
-            draws, strategy, mined_config=mined_cfg, strategy_weights=strategy_weights, conn=conn
+            draws, strategy, mined_config=mined_cfg, strategy_weights=strategy_weights, conn=conn, issue_no=target_issue
         )
         main_numbers = [n for n, _, _, _ in picks]
         conn.executemany(
@@ -1299,6 +1287,7 @@ def run_historical_backtest(
                 strategy,
                 mined_config=mined_cfg,
                 conn=conn,
+                issue_no=issue_no,
             )
             picked_main = [n for n, _, _, _ in main_picks]
             pools = _build_candidate_pools(score_map, picked_main)
@@ -1783,7 +1772,6 @@ def get_hot_cold_zodiacs(conn: sqlite3.Connection, window: int = 12, top_n: int 
         return default[:top_n], default[-top_n:]
     score_counter: Dict[str, float] = {z: 0.0 for z in ZODIAC_MAP.keys()}
     for idx, row in enumerate(rows):
-        # 越新的期次权重越高，但保留中期信息以减少抖动
         recency_w = 1.0 / (1.0 + idx * 0.35)
         numbers = json.loads(row["numbers_json"])
         for n in numbers:
@@ -1809,7 +1797,6 @@ def get_zodiac_triplet_for_two_hits(conn: sqlite3.Connection, issue_no: str, win
 
     zodiac_scores = _build_zodiac_scores_from_rows(rows)
 
-    # 用当期共识号池给生肖额外加分，让推荐和当前号池保持一致
     _, _, _, pool20, _ = _weighted_consensus_pools(conn, issue_no)
     if pool20:
         for idx, n in enumerate(pool20):
@@ -1841,7 +1828,6 @@ def _select_zodiac_triplet_from_scores(zodiac_scores: Dict[str, float]) -> List[
         mn = min(vals)
         mx = max(vals)
         spread_penalty = (mx - mn) * 0.35
-        # 目标“2中”更怕两弱一强，所以提高最弱项占比
         obj = total + mn * 0.9 - spread_penalty
         if obj > best_obj:
             best_obj = obj
@@ -2137,7 +2123,6 @@ def _weighted_consensus_pools(conn: sqlite3.Connection, issue_no: str) -> Tuple[
     if special_scores:
         special = sorted(special_scores.items(), key=lambda x: (-x[1], x[0]))[0][0]
     else:
-        # 特别号兜底：取共识池中首个不在主6内的号码
         for n in pool20:
             if n not in main6:
                 special = n
@@ -2296,7 +2281,6 @@ def send_pushplus_notification(title: str, content: str) -> bool:
 
 
 def review_latest_prediction(conn: sqlite3.Connection) -> str:
-    """显示最新一期开奖的预测与实际对比"""
     latest_draw = get_latest_draw(conn)
     if not latest_draw:
         return "暂无开奖数据。"
@@ -2391,10 +2375,8 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
 
     print_final_recommendation(conn)
 
-    # 复盘最新一期
     print("\n" + review_latest_prediction(conn))
 
-    # 微信推送
     if PUSHPLUS_TOKEN:
         rec = get_final_recommendation(conn)
         if rec:
@@ -2546,7 +2528,7 @@ def cmd_mine(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="新澳门六合彩预测工具 - 动态权重 + 三中三 + 生肖推荐 (v3集成优化)")
+    p = argparse.ArgumentParser(description="新澳门六合彩预测工具 - 动态权重 + 三中三 + 生肖推荐 (v3.1集成优化)")
     p.add_argument("--db", default=DB_PATH_DEFAULT, help=f"SQLite db path (default: {DB_PATH_DEFAULT})")
     p.add_argument("--update", action="store_true", help="Quick sync from API (same as sync)")
     p.add_argument("--remine", action="store_true", help="Re-mine pattern config before sync/backtest")
