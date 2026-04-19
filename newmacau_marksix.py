@@ -45,6 +45,20 @@ STRATEGY_WINDOWS = {
     "ensemble_v2": 10,
 }
 
+# 多策略集成优化配置
+ENSEMBLE_VERSION = "v3"   # 可切换 v2 / v3 测试
+ENSEMBLE_DIVERSITY_BONUS = 0.12   # 多样性奖励强度（0.08~0.15 之间）
+ENSEMBLE_RECENT_DECAY = 0.75      # 近期表现衰减系数
+
+# 策略基础窗口（用于自适应调整）
+STRATEGY_BASE_WINDOWS = {
+    "hot_v1": 6,
+    "momentum_v1": 7,
+    "cold_rebound_v1": 13,
+    "balanced_v1": 10,
+    "pattern_mined_v1": 10,
+}
+
 WEIGHT_WINDOW_DEFAULT = 30           # 策略权重窗口（保持不变）
 HEALTH_WINDOW_DEFAULT = 18           # 健康度检查窗口
 BACKTEST_ISSUES_DEFAULT = 120        # 回测范围可适当加大
@@ -942,50 +956,86 @@ def get_pool_numbers_for_run(conn: sqlite3.Connection, run_id: int, pool_size: i
     return valid_numbers
 
 
-def _ensemble_strategy(
+def get_adaptive_strategy_window(strategy: str, conn: sqlite3.Connection) -> int:
+    base = STRATEGY_BASE_WINDOWS.get(strategy, FEATURE_WINDOW_DEFAULT)
+    health = get_strategy_health(conn, window=20)
+    h = health.get(strategy, {})
+    recent_avg = float(h.get("recent_avg_hit", 0.65))
+    cold_streak = int(h.get("cold_streak", 0))
+
+    if recent_avg >= 0.95:
+        return max(5, base - 2)
+    elif recent_avg >= 0.80:
+        return max(6, base - 1)
+    elif recent_avg <= 0.55 or cold_streak >= 4:
+        return min(15, base + 3)
+    elif recent_avg <= 0.65:
+        return min(13, base + 2)
+    return base
+
+
+def _ensemble_strategy_v3(
     draws: List[List[int]],
-    mined_cfg: Optional[Dict[str, float]],
+    mined_config: Optional[Dict[str, float]],
     strategy_weights: Dict[str, float],
+    conn: sqlite3.Connection,
 ) -> Tuple[List[Tuple[int, int, float, str]], int, float, Dict[int, float]]:
-    m_hot = _apply_weight_config(
-        draws, {"window": float(FEATURE_WINDOW_DEFAULT), "w_freq": 0.75, "w_omit": 0.05, "w_mom": 0.20}, "热号策略"
-    )
-    m_cold = _apply_weight_config(
-        draws, {"window": float(FEATURE_WINDOW_DEFAULT), "w_freq": 0.05, "w_omit": 0.65, "w_mom": 0.30}, "冷号回补"
-    )
-    m_mom = _apply_weight_config(
-        draws, {"window": float(FEATURE_WINDOW_DEFAULT), "w_freq": 0.15, "w_omit": 0.0, "w_mom": 0.85}, "近期动量"
-    )
-    m_bal = _apply_weight_config(
-        draws,
-        {
-            "window": float(FEATURE_WINDOW_DEFAULT),
-            "w_freq": 0.4,
-            "w_omit": 0.3,
-            "w_mom": 0.2,
-            "w_pair": 0.05,
-            "w_zone": 0.05,
-        },
-        "组合策略",
-    )
-    m_mined = _apply_weight_config(draws, mined_cfg or _default_mined_config(), "规律挖掘")
+    """多策略集成优化 v3：动态权重 + 自适应窗口 + 多样性奖励"""
+    sub_strategies = ["hot_v1", "cold_rebound_v1", "momentum_v1", "balanced_v1", "pattern_mined_v1"]
+    score_maps = []
+    sub_picks = {}   # 用于计算多样性
 
-    score_maps = [m_hot[3], m_cold[3], m_mom[3], m_bal[3], m_mined[3]]
+    for sub in sub_strategies:
+        # 1. 自适应窗口
+        win_size = get_adaptive_strategy_window(sub, conn)
+        sub_draws = draws[:win_size] if len(draws) > win_size else draws
 
-    votes = {n: 0.0 for n in ALL_NUMBERS}
-    for idx, (strategy_name, score_map) in enumerate(zip(STRATEGY_IDS, score_maps)):
-        weight = strategy_weights.get(strategy_name, 0.2)
+        # 2. 生成子策略得分
+        if sub == "pattern_mined_v1":
+            cfg = mined_config or _default_mined_config()
+            cfg["window"] = float(win_size)
+            _, _, _, score_map = _apply_weight_config(sub_draws, cfg, "规律挖掘")
+        else:
+            config = {"window": float(win_size)}
+            if sub == "hot_v1":
+                config.update({"w_freq": 0.78, "w_omit": 0.05, "w_mom": 0.17})
+            elif sub == "cold_rebound_v1":
+                config.update({"w_freq": 0.05, "w_omit": 0.68, "w_mom": 0.27})
+            elif sub == "momentum_v1":
+                config.update({"w_freq": 0.12, "w_omit": 0.05, "w_mom": 0.83})
+            else:
+                config.update({"w_freq": 0.40, "w_omit": 0.30, "w_mom": 0.20})
+            _, _, _, score_map = _apply_weight_config(sub_draws, config, STRATEGY_LABELS.get(sub, sub))
+        
+        score_maps.append(score_map)
+        # 保存前6号用于多样性计算
         ranked = sorted(score_map.items(), key=lambda x: x[1], reverse=True)
-        for rank, (n, _) in enumerate(ranked):
-            votes[n] += weight * (49 - rank)
-    voted = _normalize(votes)
+        sub_picks[sub] = [n for n, _ in ranked[:6]]
 
-    picked = _pick_top_six(voted, "集成投票")
+    # 3. 动态加权投票（使用最新保护权重）
+    votes = {n: 0.0 for n in ALL_NUMBERS}
+    for idx, sub in enumerate(sub_strategies):
+        w = strategy_weights.get(sub, 0.2)
+        ranked = sorted(score_maps[idx].items(), key=lambda x: x[1], reverse=True)
+        for rank, (n, _) in enumerate(ranked):
+            votes[n] += w * (49 - rank)
+
+    # 4. 多样性奖励（关键优化）
+    diversity_score = {}
+    for n in ALL_NUMBERS:
+        appear_count = sum(1 for picks in sub_picks.values() if n in picks)
+        diversity_score[n] = (6 - appear_count) * ENSEMBLE_DIVERSITY_BONUS   # 出现越少，奖励越高
+        votes[n] += diversity_score[n]
+
+    # 5. 最终归一化 + 二次精选
+    voted = _normalize(votes)
+    picked = _pick_top_six(voted, "集成投票v3")
+
+    # 特别号
     main_set = {n for n, _, _, _ in picked}
     candidates = [(n, s) for n, s in sorted(voted.items(), key=lambda x: x[1], reverse=True) if n not in main_set]
-    if not candidates:
-        candidates = sorted(voted.items(), key=lambda x: x[1], reverse=True)
-    special_number, special_score = candidates[0]
+    special_number, special_score = candidates[0] if candidates else (list(voted.keys())[0], 0.0)
+
     return picked, special_number, special_score, voted
 
 
@@ -994,6 +1044,7 @@ def generate_strategy(
     strategy: str,
     mined_config: Optional[Dict[str, float]] = None,
     strategy_weights: Optional[Dict[str, float]] = None,
+    conn: Optional[sqlite3.Connection] = None,
 ) -> Tuple[List[Tuple[int, int, float, str]], int, float, Dict[int, float]]:
     
     # === 策略专用窗口（核心优化点）===
@@ -1042,11 +1093,13 @@ def generate_strategy(
         cfg["window"] = float(window_size)          # 让规律挖掘也使用优化窗口
         return _apply_weight_config(strategy_draws, cfg, "规律挖掘")
     
-    elif strategy == "ensemble_v2":
-        # ensemble 使用统一最优窗口
+    elif strategy == "ensemble_v2" or strategy == "ensemble_v3":
         if strategy_weights is None:
-            strategy_weights = {s: 1.0 / len(STRATEGY_IDS) for s in STRATEGY_IDS}
-        return _ensemble_strategy(strategy_draws, mined_config, strategy_weights)
+            strategy_weights = get_strategy_weights(conn, window=WEIGHT_WINDOW_DEFAULT) if conn else {s: 1.0/len(STRATEGY_IDS) for s in STRATEGY_IDS}
+        if conn is None:
+            # 降级方案：无数据库连接时使用基础集成
+            raise ValueError("ensemble_v2/v3 requires database connection")
+        return _ensemble_strategy_v3(strategy_draws, mined_config, strategy_weights, conn)
     
     # 默认 fallback
     return _apply_weight_config(
@@ -1107,7 +1160,7 @@ def generate_predictions(conn: sqlite3.Connection, issue_no: Optional[str] = Non
             run_id = cur.lastrowid
 
         picks, special_number, special_score, score_map = generate_strategy(
-            draws, strategy, mined_config=mined_cfg, strategy_weights=strategy_weights
+            draws, strategy, mined_config=mined_cfg, strategy_weights=strategy_weights, conn=conn
         )
         main_numbers = [n for n, _, _, _ in picks]
         conn.executemany(
@@ -1206,6 +1259,7 @@ def run_historical_backtest(
                 history_desc,
                 strategy,
                 mined_config=mined_cfg,
+                conn=conn,
             )
             picked_main = [n for n, _, _, _ in main_picks]
             pools = _build_candidate_pools(score_map, picked_main)
@@ -1514,7 +1568,7 @@ def backfill_missing_special_picks(conn: sqlite3.Connection) -> int:
         main_set = {int(r["number"]) for r in mains}
         strategy_name = str(run["strategy"])
         cfg = mined_cfg if strategy_name == "pattern_mined_v1" else None
-        _, special_number, special_score, _ = generate_strategy(draws, strategy_name, mined_config=cfg)
+        _, special_number, special_score, _ = generate_strategy(draws, strategy_name, mined_config=cfg, conn=conn)
 
         if special_number in main_set:
             for n in ALL_NUMBERS:
@@ -2445,7 +2499,7 @@ def cmd_mine(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="新澳门六合彩预测工具 - 动态权重 + 三中三 + 生肖推荐")
+    p = argparse.ArgumentParser(description="新澳门六合彩预测工具 - 动态权重 + 三中三 + 生肖推荐 (v3集成优化)")
     p.add_argument("--db", default=DB_PATH_DEFAULT, help=f"SQLite db path (default: {DB_PATH_DEFAULT})")
     p.add_argument("--update", action="store_true", help="Quick sync from API (same as sync)")
     p.add_argument("--remine", action="store_true", help="Re-mine pattern config before sync/backtest")
