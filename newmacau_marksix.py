@@ -26,6 +26,10 @@ MACAU_API_URL = "https://marksix6.net/index.php?api=1"
 
 MINED_CONFIG_KEY = "mined_strategy_config_v1"
 ALL_NUMBERS = list(range(1, 50))
+FEATURE_WINDOW_DEFAULT = 8
+WEIGHT_WINDOW_DEFAULT = 30
+BACKTEST_ISSUES_DEFAULT = 60
+HEALTH_WINDOW_DEFAULT = 20
 STRATEGY_LABELS = {
     "balanced_v1": "组合策略",
     "hot_v1": "热号策略",
@@ -688,7 +692,7 @@ def _pick_top_six(scores: Dict[int, float], reason: str) -> List[Tuple[int, int,
 
 def _default_mined_config() -> Dict[str, float]:
     return {
-        "window": 3.0,
+        "window": float(FEATURE_WINDOW_DEFAULT),
         "w_freq": 0.40,
         "w_omit": 0.30,
         "w_mom": 0.20,
@@ -699,7 +703,7 @@ def _default_mined_config() -> Dict[str, float]:
 
 
 def _candidate_mined_configs() -> List[Dict[str, float]]:
-    windows = [3]
+    windows = [6, 9, 12, 18]
     weight_triplets = [
         (0.50, 0.30, 0.20),
         (0.45, 0.35, 0.20),
@@ -740,7 +744,7 @@ def _apply_weight_config(
     config: Dict[str, float],
     reason: str,
 ) -> Tuple[List[Tuple[int, int, float, str]], int, float, Dict[int, float]]:
-    window_size = int(config.get("window", 3))
+    window_size = int(config.get("window", FEATURE_WINDOW_DEFAULT))
     window = draws[: max(3, window_size)]
     freq = _normalize(_freq_map(window))
     omission = _normalize(_omission_map(window))
@@ -883,7 +887,16 @@ def get_pool_numbers_for_run(conn: sqlite3.Connection, run_id: int, pool_size: i
         nums = json.loads(row["numbers_json"])
     except Exception:
         return []
-    return [int(n) for n in nums if isinstance(n, (int, float)) or str(n).isdigit()]
+    valid_numbers: List[int] = []
+    for n in nums:
+        if isinstance(n, int) and 1 <= n <= 49:
+            valid_numbers.append(n)
+            continue
+        if isinstance(n, str) and n.isdigit():
+            parsed = int(n)
+            if 1 <= parsed <= 49:
+                valid_numbers.append(parsed)
+    return valid_numbers
 
 
 def _ensemble_strategy(
@@ -891,12 +904,25 @@ def _ensemble_strategy(
     mined_cfg: Optional[Dict[str, float]],
     strategy_weights: Dict[str, float],
 ) -> Tuple[List[Tuple[int, int, float, str]], int, float, Dict[int, float]]:
-    m_hot = _apply_weight_config(draws, {"window": 3.0, "w_freq": 0.8, "w_omit": 0.0, "w_mom": 0.2}, "热号策略")
-    m_cold = _apply_weight_config(draws, {"window": 3.0, "w_freq": 0.0, "w_omit": 0.7, "w_mom": 0.3}, "冷号回补")
-    m_mom = _apply_weight_config(draws, {"window": 3.0, "w_freq": 0.1, "w_omit": 0.0, "w_mom": 0.9}, "近期动量")
+    m_hot = _apply_weight_config(
+        draws, {"window": float(FEATURE_WINDOW_DEFAULT), "w_freq": 0.75, "w_omit": 0.05, "w_mom": 0.20}, "热号策略"
+    )
+    m_cold = _apply_weight_config(
+        draws, {"window": float(FEATURE_WINDOW_DEFAULT), "w_freq": 0.05, "w_omit": 0.65, "w_mom": 0.30}, "冷号回补"
+    )
+    m_mom = _apply_weight_config(
+        draws, {"window": float(FEATURE_WINDOW_DEFAULT), "w_freq": 0.15, "w_omit": 0.0, "w_mom": 0.85}, "近期动量"
+    )
     m_bal = _apply_weight_config(
         draws,
-        {"window": 3.0, "w_freq": 0.4, "w_omit": 0.3, "w_mom": 0.2, "w_pair": 0.05, "w_zone": 0.05},
+        {
+            "window": float(FEATURE_WINDOW_DEFAULT),
+            "w_freq": 0.4,
+            "w_omit": 0.3,
+            "w_mom": 0.2,
+            "w_pair": 0.05,
+            "w_zone": 0.05,
+        },
         "组合策略",
     )
     m_mined = _apply_weight_config(draws, mined_cfg or _default_mined_config(), "规律挖掘")
@@ -927,11 +953,17 @@ def generate_strategy(
     strategy_weights: Optional[Dict[str, float]] = None,
 ) -> Tuple[List[Tuple[int, int, float, str]], int, float, Dict[int, float]]:
     if strategy == "hot_v1":
-        return _apply_weight_config(draws, {"window": 3.0, "w_freq": 0.8, "w_omit": 0.0, "w_mom": 0.2}, "热号策略")
+        return _apply_weight_config(
+            draws, {"window": float(FEATURE_WINDOW_DEFAULT), "w_freq": 0.75, "w_omit": 0.05, "w_mom": 0.20}, "热号策略"
+        )
     if strategy == "cold_rebound_v1":
-        return _apply_weight_config(draws, {"window": 3.0, "w_freq": 0.0, "w_omit": 0.7, "w_mom": 0.3}, "冷号回补")
+        return _apply_weight_config(
+            draws, {"window": float(FEATURE_WINDOW_DEFAULT), "w_freq": 0.05, "w_omit": 0.65, "w_mom": 0.30}, "冷号回补"
+        )
     if strategy == "momentum_v1":
-        return _apply_weight_config(draws, {"window": 3.0, "w_freq": 0.1, "w_omit": 0.0, "w_mom": 0.9}, "近期动量")
+        return _apply_weight_config(
+            draws, {"window": float(FEATURE_WINDOW_DEFAULT), "w_freq": 0.15, "w_omit": 0.0, "w_mom": 0.85}, "近期动量"
+        )
     if strategy == "ensemble_v2":
         if strategy_weights is None:
             strategy_weights = {s: 1.0/len(STRATEGY_IDS) for s in STRATEGY_IDS}
@@ -941,7 +973,14 @@ def generate_strategy(
         return _apply_weight_config(draws, cfg, "规律挖掘")
     return _apply_weight_config(
         draws,
-        {"window": 3.0, "w_freq": 0.40, "w_omit": 0.30, "w_mom": 0.20, "w_pair": 0.05, "w_zone": 0.05},
+        {
+            "window": float(FEATURE_WINDOW_DEFAULT),
+            "w_freq": 0.40,
+            "w_omit": 0.30,
+            "w_mom": 0.20,
+            "w_pair": 0.05,
+            "w_zone": 0.05,
+        },
         "组合策略",
     )
 
@@ -951,12 +990,12 @@ def generate_predictions(conn: sqlite3.Connection, issue_no: Optional[str] = Non
     if not row:
         raise RuntimeError("No draws found. Run sync/bootstrap first.")
     target_issue = issue_no or next_issue(row["issue_no"])
-    draws = load_recent_draws(conn, 3)
+    draws = load_recent_draws(conn, FEATURE_WINDOW_DEFAULT)
     if len(draws) < 3:
         raise RuntimeError("Need at least 3 draws to generate predictions.")
     mined_cfg = ensure_mined_pattern_config(conn, force=False)
 
-    strategy_weights = get_strategy_weights(conn, window=3)
+    strategy_weights = get_strategy_weights(conn, window=WEIGHT_WINDOW_DEFAULT)
 
     for strategy in STRATEGY_IDS:
         now = utc_now()
@@ -1018,7 +1057,7 @@ def run_historical_backtest(
     min_history: int = 3,
     rebuild: bool = False,
     progress_every: int = 20,
-    max_issues: int = 3,
+    max_issues: int = BACKTEST_ISSUES_DEFAULT,
 ) -> Tuple[int, int]:
     draws = _draws_ordered_asc(conn)
     if len(draws) <= min_history:
@@ -1069,7 +1108,10 @@ def run_historical_backtest(
         if existing and int(existing["c"]) >= len(STRATEGY_IDS):
             continue
 
-        history_desc = [json.loads(draws[j]["numbers_json"]) for j in range(i - 1, max(-1, i - 4), -1)]
+        history_desc = [
+            json.loads(draws[j]["numbers_json"])
+            for j in range(i - 1, max(-1, i - FEATURE_WINDOW_DEFAULT - 1), -1)
+        ]
         if len(history_desc) < min_history:
             continue
         winning_main = set(json.loads(target["numbers_json"]))
@@ -1365,7 +1407,7 @@ def get_picks_for_run(conn: sqlite3.Connection, run_id: int) -> Tuple[List[int],
 
 
 def backfill_missing_special_picks(conn: sqlite3.Connection) -> int:
-    draws = load_recent_draws(conn, 3)
+    draws = load_recent_draws(conn, FEATURE_WINDOW_DEFAULT)
     if len(draws) < 3:
         return 0
     mined_cfg = ensure_mined_pattern_config(conn, force=False)
@@ -1444,7 +1486,7 @@ def print_recommendation_sheet(conn: sqlite3.Connection, limit: int = 8) -> None
 
 
 # ========== 动态权重相关函数 ==========
-def get_strategy_weights(conn: sqlite3.Connection, window: int = 3) -> Dict[str, float]:
+def get_strategy_weights(conn: sqlite3.Connection, window: int = WEIGHT_WINDOW_DEFAULT) -> Dict[str, float]:
     rows = conn.execute("""
         SELECT strategy, AVG(main_hit_count) as avg_hit
         FROM strategy_performance
@@ -1453,14 +1495,36 @@ def get_strategy_weights(conn: sqlite3.Connection, window: int = 3) -> Dict[str,
         )
         GROUP BY strategy
     """, (window,)).fetchall()
-    if not rows:
-        return {s: 1.0/len(STRATEGY_IDS) for s in STRATEGY_IDS}
-    weights = {r["strategy"]: max(r["avg_hit"], 0.5) for r in rows}
+    baseline = 0.6
+    weights = {s: baseline for s in STRATEGY_IDS}
+    for r in rows:
+        strategy = str(r["strategy"])
+        avg_hit = float(r["avg_hit"] or 0.0)
+        if strategy in weights:
+            weights[strategy] = max(avg_hit, baseline)
+    # 短期健康度抑制：近期持续走弱则自动降权
+    health = get_strategy_health(conn, window=HEALTH_WINDOW_DEFAULT)
+    for strategy, h in health.items():
+        if strategy not in weights:
+            continue
+        recent_avg_hit = float(h.get("recent_avg_hit", 0.0))
+        hit1_rate = float(h.get("hit1_rate", 0.0))
+        cold_streak = int(h.get("cold_streak", 0))
+        shrink = 1.0
+        if recent_avg_hit < 0.8:
+            shrink *= 0.85
+        if hit1_rate < 0.45:
+            shrink *= 0.85
+        if cold_streak >= 3:
+            shrink *= 0.80
+        weights[strategy] = max(0.05, weights[strategy] * shrink)
     total = sum(weights.values())
-    return {k: v/total for k, v in weights.items()}
+    if total <= 0:
+        return {s: 1.0 / len(STRATEGY_IDS) for s in STRATEGY_IDS}
+    return {k: v / total for k, v in weights.items()}
 
 
-def get_trio_weights(conn: sqlite3.Connection, window: int = 3) -> Tuple[float, float, float]:
+def get_trio_weights(conn: sqlite3.Connection, window: int = WEIGHT_WINDOW_DEFAULT) -> Tuple[float, float, float]:
     rows = conn.execute("""
         SELECT strategy, AVG(main_hit_count) as avg_hit
         FROM strategy_performance
@@ -1469,11 +1533,57 @@ def get_trio_weights(conn: sqlite3.Connection, window: int = 3) -> Tuple[float, 
         GROUP BY strategy
     """, (window,)).fetchall()
     stats = {r["strategy"]: r["avg_hit"] for r in rows}
-    w_mom = stats.get('momentum_v1', 0.4)
-    w_hot = stats.get('hot_v1', 0.3)
-    w_cold = stats.get('cold_rebound_v1', 0.3)
+    w_mom = max(float(stats.get('momentum_v1', 0.0) or 0.0), 0.6)
+    w_hot = max(float(stats.get('hot_v1', 0.0) or 0.0), 0.6)
+    w_cold = max(float(stats.get('cold_rebound_v1', 0.0) or 0.0), 0.6)
     total = w_mom + w_hot + w_cold
     return w_mom/total, w_hot/total, w_cold/total
+
+
+def get_strategy_health(conn: sqlite3.Connection, window: int = HEALTH_WINDOW_DEFAULT) -> Dict[str, Dict[str, float]]:
+    health: Dict[str, Dict[str, float]] = {}
+    for strategy in STRATEGY_IDS:
+        rows = conn.execute(
+            """
+            SELECT hit_count
+            FROM prediction_runs
+            WHERE strategy = ? AND status = 'REVIEWED'
+            ORDER BY reviewed_at DESC
+            LIMIT ?
+            """,
+            (strategy, window),
+        ).fetchall()
+        if not rows:
+            health[strategy] = {
+                "samples": 0.0,
+                "recent_avg_hit": 0.0,
+                "hit1_rate": 0.0,
+                "hit2_rate": 0.0,
+                "cold_streak": 0.0,
+            }
+            continue
+
+        hit_counts = [int(r["hit_count"] or 0) for r in rows]
+        samples = len(hit_counts)
+        hit1_rate = sum(1 for x in hit_counts if x >= 1) / samples
+        hit2_rate = sum(1 for x in hit_counts if x >= 2) / samples
+        recent_avg_hit = sum(hit_counts) / samples
+
+        cold_streak = 0
+        for x in hit_counts:
+            if x == 0:
+                cold_streak += 1
+            else:
+                break
+
+        health[strategy] = {
+            "samples": float(samples),
+            "recent_avg_hit": float(recent_avg_hit),
+            "hit1_rate": float(hit1_rate),
+            "hit2_rate": float(hit2_rate),
+            "cold_streak": float(cold_streak),
+        }
+    return health
 
 
 # ========== 生肖相关函数 ==========
@@ -1560,7 +1670,7 @@ def get_merged_pool20(conn: sqlite3.Connection, issue_no: str) -> List[int]:
 
 
 def score_numbers_for_trio(conn: sqlite3.Connection, candidate_numbers: List[int]) -> Dict[int, float]:
-    draws = load_recent_draws(conn, 3)
+    draws = load_recent_draws(conn, FEATURE_WINDOW_DEFAULT)
     if len(draws) < 3:
         return {n: 0.0 for n in candidate_numbers}
     momentum = _momentum_map(draws)
@@ -1569,7 +1679,7 @@ def score_numbers_for_trio(conn: sqlite3.Connection, candidate_numbers: List[int
     momentum_norm = _normalize(momentum)
     freq_norm = _normalize(freq)
     omission_norm = _normalize(omission)
-    w_mom, w_hot, w_cold = get_trio_weights(conn, window=3)
+    w_mom, w_hot, w_cold = get_trio_weights(conn, window=WEIGHT_WINDOW_DEFAULT)
     scores = {}
     for n in candidate_numbers:
         scores[n] = (w_mom * momentum_norm.get(n, 0) +
@@ -1657,7 +1767,7 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
 
     print("\n" + "=" * 50)
     print(f"【最终推荐 - 期号 {issue_no}】")
-    print(f"策略说明: 主号采用「热号策略」(基于最近3期数据)，特别号采用「近期动量」")
+    print(f"策略说明: 主号采用「热号策略」(基于最近{FEATURE_WINDOW_DEFAULT}期数据)，特别号采用「近期动量」")
     print(f"  6号池 : {p6} | 特别号: {special_text}")
     print(f"  10号池: {p10} | 特别号: {special_text}")
     print(f"  14号池: {p14} | 特别号: {special_text}")
@@ -1758,6 +1868,23 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
             f"特别号命中率={s['special_rate'] * 100:.2f}% 至少中1个={s['hit1_rate'] * 100:.2f}% 至少中2个={s['hit2_rate'] * 100:.2f}%"
         )
 
+    print(f"\n策略健康度（最近{HEALTH_WINDOW_DEFAULT}期）:")
+    weights = get_strategy_weights(conn, window=WEIGHT_WINDOW_DEFAULT)
+    health = get_strategy_health(conn, window=HEALTH_WINDOW_DEFAULT)
+    for strategy in STRATEGY_IDS:
+        strategy_name = STRATEGY_LABELS.get(strategy, strategy)
+        h = health.get(strategy, {})
+        samples = int(h.get("samples", 0.0))
+        avg_hit = float(h.get("recent_avg_hit", 0.0))
+        hit1 = float(h.get("hit1_rate", 0.0)) * 100.0
+        hit2 = float(h.get("hit2_rate", 0.0)) * 100.0
+        cold = int(h.get("cold_streak", 0.0))
+        weight = float(weights.get(strategy, 0.0)) * 100.0
+        print(
+            f"  - {strategy_name}: 样本={samples} 最近均中={avg_hit:.2f} "
+            f"近1中率={hit1:.1f}% 近2中率={hit2:.1f}% 连挂={cold} 当前权重={weight:.1f}%"
+        )
+
     print_final_recommendation(conn)
 
     # 复盘最新一期
@@ -1816,8 +1943,8 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
         init_db(conn)
         records = fetch_macau_records()
         total, inserted, updated = sync_from_records(conn, records, source="macau_api")
-        print("自动执行轻量回测（最近3期）...")
-        run_historical_backtest(conn, rebuild=True, max_issues=3)
+        print(f"自动执行轻量回测（最近{BACKTEST_ISSUES_DEFAULT}期）...")
+        run_historical_backtest(conn, rebuild=True, max_issues=BACKTEST_ISSUES_DEFAULT)
         issue = generate_predictions(conn)
         print(f"Bootstrap done. total={total}, inserted={inserted}, updated={updated}, next_prediction={issue}")
     finally:
@@ -1840,7 +1967,7 @@ def cmd_sync(args: argparse.Namespace) -> None:
         reviewed = review_latest(conn)
         bt_issues, bt_runs = 0, 0
         if args.with_backtest:
-            bt_issues, bt_runs = run_historical_backtest(conn, rebuild=False, max_issues=3)
+            bt_issues, bt_runs = run_historical_backtest(conn, rebuild=False, max_issues=BACKTEST_ISSUES_DEFAULT)
         issue = generate_predictions(conn)
         patched = backfill_missing_special_picks(conn)
         print(f"Sync done. total={total}, inserted={inserted}, updated={updated}, reviewed={reviewed}, next_prediction={issue}")
@@ -1896,7 +2023,7 @@ def cmd_backtest(args: argparse.Namespace) -> None:
             min_history=args.min_history,
             rebuild=args.rebuild,
             progress_every=args.progress_every,
-            max_issues=args.max_issues if hasattr(args, 'max_issues') else 3,
+            max_issues=args.max_issues if hasattr(args, 'max_issues') else BACKTEST_ISSUES_DEFAULT,
         )
         print(f"Backtest done. issues={issues}, strategy_runs={runs}, rebuild={args.rebuild}")
         print(f"Mined config: {json.dumps(mined_cfg, ensure_ascii=False)}")
@@ -1917,19 +2044,18 @@ def cmd_mine(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="新澳门六合彩预测工具 - 动态权重 + 三中三 + 生肖推荐")
     p.add_argument("--db", default=DB_PATH_DEFAULT, help=f"SQLite db path (default: {DB_PATH_DEFAULT})")
-    p.add_argument("--update", action="store_true", help="Quick sync (same as sync)")
-    p.add_argument("--update-csv", default=CSV_PATH_DEFAULT, help=f"CSV path used with --update (default: {CSV_PATH_DEFAULT})")
+    p.add_argument("--update", action="store_true", help="Quick sync from API (same as sync)")
     p.add_argument("--remine", action="store_true", help="Re-mine pattern config before sync/backtest")
     p.add_argument("--require-continuity", action="store_true", default=True, help="Fail update when issue sequence has gaps")
     p.add_argument("--no-require-continuity", dest="require_continuity", action="store_false", help="Allow gaps")
-    p.add_argument("--with-backtest", action="store_true", help="Run incremental backtest after sync (only last 3 issues)")
+    p.add_argument("--with-backtest", action="store_true", help=f"Run incremental backtest after sync (default last {BACKTEST_ISSUES_DEFAULT} issues)")
     sub = p.add_subparsers(dest="command", required=False)
 
     p_boot = sub.add_parser("bootstrap", help="Initial import from API and generate next issue predictions")
     p_boot.set_defaults(func=cmd_bootstrap)
 
     p_sync = sub.add_parser("sync", help="Sync draws from API, review latest, generate next prediction")
-    p_sync.add_argument("--with-backtest", action="store_true", help="Run incremental backtest after sync (only last 3 issues)")
+    p_sync.add_argument("--with-backtest", action="store_true", help=f"Run incremental backtest after sync (default last {BACKTEST_ISSUES_DEFAULT} issues)")
     p_sync.set_defaults(func=cmd_sync)
 
     p_predict = sub.add_parser("predict", help="Generate predictions for next or specified issue")
@@ -1947,7 +2073,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_backtest.add_argument("--min-history", type=int, default=3, help="Min history window before first backtest issue")
     p_backtest.add_argument("--rebuild", action="store_true", help="Rebuild reviewed backtest runs from scratch")
     p_backtest.add_argument("--remine", action="store_true", help="Re-mine pattern config before backtest")
-    p_backtest.add_argument("--max-issues", type=int, default=3, help="只回测最近 N 期（0=全部）")
+    p_backtest.add_argument("--max-issues", type=int, default=BACKTEST_ISSUES_DEFAULT, help="只回测最近 N 期（0=全部）")
     p_backtest.add_argument("--progress-every", type=int, default=20, help="Print backtest progress every N processed issues (0 to disable)")
     p_backtest.set_defaults(func=cmd_backtest)
 
@@ -1961,7 +2087,6 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     if args.update:
-        args.csv = args.update_csv
         cmd_sync(args)
         return
     if not args.command:
