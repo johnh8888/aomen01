@@ -1655,6 +1655,58 @@ def get_top_special_votes(conn: sqlite3.Connection, issue_no: str, top_n: int = 
     return [num for num, _ in sorted_items[:top_n]]
 
 
+def _weighted_consensus_pools(conn: sqlite3.Connection, issue_no: str) -> Tuple[List[int], List[int], List[int], List[int], Optional[int]]:
+    strategy_weights = get_strategy_weights(conn, window=WEIGHT_WINDOW_DEFAULT)
+    number_scores: Dict[int, float] = {}
+    special_scores: Dict[int, float] = {}
+
+    for strategy in STRATEGY_IDS:
+        run = conn.execute(
+            "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = ? AND status='PENDING'",
+            (issue_no, strategy),
+        ).fetchone()
+        if not run:
+            continue
+        run_id = int(run["id"])
+        w = float(strategy_weights.get(strategy, 1.0 / len(STRATEGY_IDS)))
+        pool20 = get_pool_numbers_for_run(conn, run_id, 20)
+        for idx, n in enumerate(pool20):
+            if not (1 <= int(n) <= 49):
+                continue
+            rank_boost = (20 - idx) / 20.0
+            number_scores[int(n)] = number_scores.get(int(n), 0.0) + w * rank_boost
+
+        main6 = get_pool_numbers_for_run(conn, run_id, 6)
+        for n in main6:
+            if 1 <= int(n) <= 49:
+                number_scores[int(n)] = number_scores.get(int(n), 0.0) + w * 0.35
+
+        _, special = get_picks_for_run(conn, run_id)
+        if special is not None and 1 <= int(special) <= 49:
+            special_scores[int(special)] = special_scores.get(int(special), 0.0) + w
+
+    if not number_scores:
+        return [], [], [], [], None
+
+    ranked_numbers = [n for n, _ in sorted(number_scores.items(), key=lambda x: (-x[1], x[0]))]
+    pool20 = ranked_numbers[:20]
+    pool14 = pool20[:14]
+    pool10 = pool20[:10]
+    main6 = pool20[:6]
+
+    special = None
+    if special_scores:
+        special = sorted(special_scores.items(), key=lambda x: (-x[1], x[0]))[0][0]
+    else:
+        # 特别号兜底：取共识池中首个不在主6内的号码
+        for n in pool20:
+            if n not in main6:
+                special = n
+                break
+
+    return main6, pool10, pool14, pool20, special
+
+
 # ========== 三中三新逻辑（动态权重） ==========
 def get_merged_pool20(conn: sqlite3.Connection, issue_no: str) -> List[int]:
     all_numbers = set()
@@ -1716,27 +1768,8 @@ def get_final_recommendation(conn: sqlite3.Connection):
         return None
     issue_no = row["issue_no"]
 
-    hot_run = conn.execute(
-        "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = 'hot_v1' AND status='PENDING'",
-        (issue_no,)
-    ).fetchone()
-    if not hot_run:
-        return None
-    hot_id = hot_run["id"]
-    main6 = get_pool_numbers_for_run(conn, hot_id, 6)
-    pool10 = get_pool_numbers_for_run(conn, hot_id, 10)
-    pool14 = get_pool_numbers_for_run(conn, hot_id, 14)
-    pool20 = get_pool_numbers_for_run(conn, hot_id, 20)
-
-    mom_run = conn.execute(
-        "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = 'momentum_v1' AND status='PENDING'",
-        (issue_no,)
-    ).fetchone()
-    if not mom_run:
-        return None
-    mom_id = mom_run["id"]
-    _, special = get_picks_for_run(conn, mom_id)
-    if special is None:
+    main6, pool10, pool14, pool20, special = _weighted_consensus_pools(conn, issue_no)
+    if not main6 or not pool10 or not pool14 or not pool20 or special is None:
         return None
 
     predict_trio = get_trio_from_merged_pool20(conn, issue_no)
@@ -1767,7 +1800,7 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
 
     print("\n" + "=" * 50)
     print(f"【最终推荐 - 期号 {issue_no}】")
-    print(f"策略说明: 主号采用「热号策略」(基于最近{FEATURE_WINDOW_DEFAULT}期数据)，特别号采用「近期动量」")
+    print(f"策略说明: 主号采用「多策略加权共识」(基于最近{FEATURE_WINDOW_DEFAULT}期特征 + 近{WEIGHT_WINDOW_DEFAULT}期动态权重)，特别号采用「加权投票」")
     print(f"  6号池 : {p6} | 特别号: {special_text}")
     print(f"  10号池: {p10} | 特别号: {special_text}")
     print(f"  14号池: {p14} | 特别号: {special_text}")
