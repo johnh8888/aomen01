@@ -1623,7 +1623,7 @@ def get_zodiac_by_number(number: int) -> str:
     return "马"
 
 
-def get_hot_cold_zodiacs(conn: sqlite3.Connection, window: int = 3, top_n: int = 3) -> Tuple[List[str], List[str]]:
+def get_hot_cold_zodiacs(conn: sqlite3.Connection, window: int = 12, top_n: int = 3) -> Tuple[List[str], List[str]]:
     rows = conn.execute(
         "SELECT numbers_json, special_number FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT ?",
         (window,)
@@ -1631,17 +1631,19 @@ def get_hot_cold_zodiacs(conn: sqlite3.Connection, window: int = 3, top_n: int =
     if len(rows) < window:
         default = ["马", "蛇", "龙", "兔", "虎", "牛"]
         return default[:top_n], default[-top_n:]
-    counter = Counter()
-    for row in rows:
+    score_counter: Dict[str, float] = {z: 0.0 for z in ZODIAC_MAP.keys()}
+    for idx, row in enumerate(rows):
+        # 越新的期次权重越高，但保留中期信息以减少抖动
+        recency_w = 1.0 / (1.0 + idx * 0.35)
         numbers = json.loads(row["numbers_json"])
         for n in numbers:
-            counter[get_zodiac_by_number(n)] += 1
+            score_counter[get_zodiac_by_number(n)] += 1.0 * recency_w
         special = row["special_number"]
-        counter[get_zodiac_by_number(special)] += 1
-    sorted_by_freq = sorted(counter.items(), key=lambda x: x[1], reverse=True)
+        score_counter[get_zodiac_by_number(special)] += 1.2 * recency_w
+    sorted_by_freq = sorted(score_counter.items(), key=lambda x: x[1], reverse=True)
     hot = [z for z, _ in sorted_by_freq[:top_n]]
     all_zodiacs = list(ZODIAC_MAP.keys())
-    cold_candidates = [(z, counter.get(z, 0)) for z in all_zodiacs]
+    cold_candidates = [(z, score_counter.get(z, 0.0)) for z in all_zodiacs]
     cold_candidates.sort(key=lambda x: x[1])
     cold = [z for z, _ in cold_candidates[:top_n]]
     return hot, cold
@@ -1682,6 +1684,32 @@ def get_top_special_votes(conn: sqlite3.Connection, issue_no: str, top_n: int = 
     vote_counter = Counter(all_specials)
     sorted_items = sorted(vote_counter.items(), key=lambda x: (-x[1], x[0]))
     return [num for num, _ in sorted_items[:top_n]]
+
+
+def get_special_recommendation(conn: sqlite3.Connection, issue_no: str, main6: Sequence[int]) -> Tuple[Optional[int], List[int], bool]:
+    top_votes = get_top_special_votes(conn, issue_no, top_n=6)
+    if not top_votes:
+        return None, [], False
+    mains = {int(n) for n in main6}
+    primary = int(top_votes[0])
+    conflict = primary in mains
+    had_conflict = conflict
+    if conflict:
+        for n in top_votes[1:]:
+            if int(n) not in mains:
+                primary = int(n)
+                break
+    defenses: List[int] = []
+    for n in top_votes:
+        n_int = int(n)
+        if n_int == primary or n_int in defenses:
+            continue
+        if n_int in mains:
+            continue
+        defenses.append(n_int)
+        if len(defenses) >= 2:
+            break
+    return primary, defenses, had_conflict
 
 
 def _weighted_consensus_pools(conn: sqlite3.Connection, issue_no: str) -> Tuple[List[int], List[int], List[int], List[int], Optional[int]]:
@@ -1797,13 +1825,20 @@ def get_final_recommendation(conn: sqlite3.Connection):
         return None
     issue_no = row["issue_no"]
 
-    main6, pool10, pool14, pool20, special = _weighted_consensus_pools(conn, issue_no)
-    if not main6 or not pool10 or not pool14 or not pool20 or special is None:
+    main6, pool10, pool14, pool20, _ = _weighted_consensus_pools(conn, issue_no)
+    if not main6 or not pool10 or not pool14 or not pool20:
+        return None
+    special, special_defenses, special_conflict = get_special_recommendation(conn, issue_no, main6)
+    if special is None:
         return None
 
     predict_trio = get_trio_from_merged_pool20(conn, issue_no)
 
-    return (issue_no, main6, special, pool10, pool14, pool20, predict_trio)
+    hot, cold = get_hot_cold_zodiacs(conn, window=12, top_n=4)
+    zodiac_combo = []
+    if len(hot) >= 2 and len(cold) >= 1:
+        zodiac_combo = [hot[0], hot[1], cold[0]]
+    return (issue_no, main6, special, pool10, pool14, pool20, predict_trio, special_defenses, special_conflict, zodiac_combo)
 
 
 def print_final_recommendation(conn: sqlite3.Connection) -> None:
@@ -1811,7 +1846,7 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     if not rec:
         print("\n最终推荐: (暂无有效预测)")
         return
-    issue_no, main6, special, pool10, pool14, pool20, predict_trio = rec
+    issue_no, main6, special, pool10, pool14, pool20, predict_trio, special_defenses, special_conflict, zodiac_combo = rec
     special_text = _fmt_num(special)
     p6 = " ".join(_fmt_num(n) for n in main6)
     p10 = " ".join(_fmt_num(n) for n in pool10)
@@ -1819,13 +1854,8 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     p20 = " ".join(_fmt_num(n) for n in pool20)
     trio_str = " ".join(_fmt_num(n) for n in predict_trio) if predict_trio else "无"
 
-    # 获取生肖推荐（使用最近3期）
-    hot, cold = get_hot_cold_zodiacs(conn, window=3, top_n=3)
-    if len(hot) >= 2 and len(cold) >= 1:
-        combo = hot[:2] + [cold[0]]
-        combo_str = "、".join(combo)
-    else:
-        combo_str = "数据不足"
+    combo_str = "、".join(zodiac_combo) if zodiac_combo else "数据不足"
+    defense_text = " ".join(_fmt_num(n) for n in special_defenses) if special_defenses else "无"
 
     print("\n" + "=" * 50)
     print(f"【最终推荐 - 期号 {issue_no}】")
@@ -1834,8 +1864,11 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     print(f"  10号池: {p10} | 特别号: {special_text}")
     print(f"  14号池: {p14} | 特别号: {special_text}")
     print(f"  20号池: {p20} | 特别号: {special_text}")
+    print(f"特别号建议: 主推 {special_text} | 防守 {defense_text}")
+    if special_conflict:
+        print("特别号提示: 主推候选与主号冲突，已自动切换到非冲突号码")
     print(f"三中三预测（综合20码池+动态权重）: {trio_str}")
-    print(f"🎯 2热+1冷生肖组合（最近3期）: {combo_str}")
+    print(f"🎯 2热+1冷生肖组合（最近12期加权）: {combo_str}")
     print("=" * 50)
 
 
@@ -1956,9 +1989,10 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
     if PUSHPLUS_TOKEN:
         rec = get_final_recommendation(conn)
         if rec:
-            issue_no, main6, special, _, _, _, predict_trio = rec
+            issue_no, main6, special, _, _, _, predict_trio, special_defenses, special_conflict, zodiac_combo = rec
             special_text = _fmt_num(special)
             trio_str = " ".join(_fmt_num(n) for n in predict_trio) if predict_trio else "无"
+            defense_text = " ".join(_fmt_num(n) for n in special_defenses) if special_defenses else "无"
 
             all_specials = []
             for strategy in STRATEGY_IDS:
@@ -1979,17 +2013,14 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
             top_special_votes = get_top_special_votes(conn, issue_no, top_n=3)
             top_special_str = " ".join(_fmt_num(n) for n in top_special_votes) if top_special_votes else "无"
 
-            hot, cold = get_hot_cold_zodiacs(conn, window=3, top_n=3)
-            if len(hot) >= 2 and len(cold) >= 1:
-                combo = hot[:2] + [cold[0]]
-                combo_str = "、".join(combo)
-            else:
-                combo_str = "数据不足"
+            combo_str = "、".join(zodiac_combo) if zodiac_combo else "数据不足"
+            conflict_tip = "（已避开主号冲突）" if special_conflict else ""
 
             content = (
                 f"【新澳门·{issue_no}期推荐】\n"
-                f"🎯 2热+1冷生肖组合（最近3期）：{combo_str}\n"
-                f"🔮 特别号（动量策略参考）：{special_text}\n"
+                f"🎯 2热+1冷生肖组合（最近12期加权）：{combo_str}\n"
+                f"🔮 特别号主推：{special_text}{conflict_tip}\n"
+                f"🛡 特别号防守：{defense_text}\n"
                 f"📊 特别号综合汇总（各策略去重）：{all_specials_str}\n"
                 f"⭐ 最终投票特别号（前三热门）：{top_special_str}\n"
                 f"🏆 三中三预测（综合20码池+动态权重）：{trio_str}\n"
