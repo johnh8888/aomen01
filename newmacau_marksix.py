@@ -7,8 +7,10 @@ import io
 import json
 import os
 import re
+import socket
 import sqlite3
 import time
+from urllib.error import URLError
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -23,6 +25,9 @@ CSV_PATH_DEFAULT = str(SCRIPT_DIR / "NewMacau_Mark_Six.csv")
 
 # 澳门数据源（使用 marksix6.net API 中的“新澳门彩”）
 MACAU_API_URL = "https://marksix6.net/index.php?api=1"
+API_TIMEOUT_DEFAULT = 20
+API_RETRIES_DEFAULT = 4
+API_RETRY_BACKOFF_SECONDS = 2.0
 
 MINED_CONFIG_KEY = "mined_strategy_config_v1"
 ALL_NUMBERS = list(range(1, 50))
@@ -439,7 +444,11 @@ def parse_macau_from_marksix6_api(payload: dict) -> List[DrawRecord]:
     return sorted(dedup.values(), key=lambda r: (r.draw_date, r.issue_no))
 
 
-def fetch_macau_records() -> List[DrawRecord]:
+def fetch_macau_records(
+    timeout: int = API_TIMEOUT_DEFAULT,
+    retries: int = API_RETRIES_DEFAULT,
+    backoff_seconds: float = API_RETRY_BACKOFF_SECONDS,
+) -> List[DrawRecord]:
     req = Request(
         MACAU_API_URL,
         headers={
@@ -447,13 +456,33 @@ def fetch_macau_records() -> List[DrawRecord]:
             "Accept": "application/json",
         },
     )
-    with urlopen(req, timeout=20) as resp:
-        raw = resp.read().decode("utf-8-sig")
-    payload = json.loads(raw)
-    records = parse_macau_from_marksix6_api(payload)
-    if not records:
-        raise RuntimeError("澳门彩数据解析失败，请检查API返回格式")
-    return records
+
+    attempts = max(1, int(retries))
+    last_error: Optional[Exception] = None
+    for attempt in range(1, attempts + 1):
+        try:
+            with urlopen(req, timeout=int(timeout)) as resp:
+                raw = resp.read().decode("utf-8-sig")
+            payload = json.loads(raw)
+            records = parse_macau_from_marksix6_api(payload)
+            if not records:
+                raise RuntimeError("澳门彩数据解析失败，请检查API返回格式")
+            return records
+        except (TimeoutError, socket.timeout, URLError, json.JSONDecodeError, RuntimeError) as exc:
+            last_error = exc
+            if attempt >= attempts:
+                break
+            delay = backoff_seconds * (2 ** (attempt - 1))
+            print(
+                f"[sync] API attempt {attempt}/{attempts} failed: {exc}. retry in {delay:.1f}s",
+                flush=True,
+            )
+            time.sleep(delay)
+
+    raise RuntimeError(
+        f"澳门API请求失败，已重试 {attempts} 次。"
+        f"请稍后重试，或检查网络/目标站点可用性。last_error={last_error}"
+    )
 
 
 def upsert_draw(conn: sqlite3.Connection, record: DrawRecord, source: str) -> str:
@@ -1974,7 +2003,7 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
     conn = connect_db(args.db)
     try:
         init_db(conn)
-        records = fetch_macau_records()
+        records = fetch_macau_records(timeout=args.api_timeout, retries=args.api_retries)
         total, inserted, updated = sync_from_records(conn, records, source="macau_api")
         print(f"自动执行轻量回测（最近{BACKTEST_ISSUES_DEFAULT}期）...")
         run_historical_backtest(conn, rebuild=True, max_issues=BACKTEST_ISSUES_DEFAULT)
@@ -1988,7 +2017,7 @@ def cmd_sync(args: argparse.Namespace) -> None:
     conn = connect_db(args.db)
     try:
         init_db(conn)
-        records = fetch_macau_records()
+        records = fetch_macau_records(timeout=args.api_timeout, retries=args.api_retries)
         if args.require_continuity:
             missing = missing_issues_since_latest(conn, records)
             if missing:
@@ -2079,6 +2108,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--db", default=DB_PATH_DEFAULT, help=f"SQLite db path (default: {DB_PATH_DEFAULT})")
     p.add_argument("--update", action="store_true", help="Quick sync from API (same as sync)")
     p.add_argument("--remine", action="store_true", help="Re-mine pattern config before sync/backtest")
+    p.add_argument("--api-timeout", type=int, default=API_TIMEOUT_DEFAULT, help="API timeout seconds per request")
+    p.add_argument("--api-retries", type=int, default=API_RETRIES_DEFAULT, help="API retry attempts when network timeout/error occurs")
     p.add_argument("--require-continuity", action="store_true", default=True, help="Fail update when issue sequence has gaps")
     p.add_argument("--no-require-continuity", dest="require_continuity", action="store_false", help="Allow gaps")
     p.add_argument("--with-backtest", action="store_true", help=f"Run incremental backtest after sync (default last {BACKTEST_ISSUES_DEFAULT} issues)")
