@@ -31,10 +31,24 @@ API_RETRY_BACKOFF_SECONDS = 2.0
 
 MINED_CONFIG_KEY = "mined_strategy_config_v1"
 ALL_NUMBERS = list(range(1, 50))
-FEATURE_WINDOW_DEFAULT = 8
-WEIGHT_WINDOW_DEFAULT = 30
-BACKTEST_ISSUES_DEFAULT = 60
-HEALTH_WINDOW_DEFAULT = 20
+
+# ==================== 窗口优化配置（已完成） ====================
+FEATURE_WINDOW_DEFAULT = 10          # 全局后备窗口
+
+# 各策略最优窗口（核心优化）
+STRATEGY_WINDOWS = {
+    "hot_v1": 6,
+    "momentum_v1": 7,
+    "cold_rebound_v1": 13,
+    "balanced_v1": 10,
+    "pattern_mined_v1": 10,
+    "ensemble_v2": 10,
+}
+
+WEIGHT_WINDOW_DEFAULT = 30           # 策略权重窗口（保持不变）
+HEALTH_WINDOW_DEFAULT = 18           # 健康度检查窗口
+BACKTEST_ISSUES_DEFAULT = 120        # 回测范围可适当加大
+
 STRATEGY_LABELS = {
     "balanced_v1": "组合策略",
     "hot_v1": "热号策略",
@@ -981,29 +995,64 @@ def generate_strategy(
     mined_config: Optional[Dict[str, float]] = None,
     strategy_weights: Optional[Dict[str, float]] = None,
 ) -> Tuple[List[Tuple[int, int, float, str]], int, float, Dict[int, float]]:
+    
+    # === 策略专用窗口（核心优化点）===
+    window_size = STRATEGY_WINDOWS.get(strategy, FEATURE_WINDOW_DEFAULT)
+    
+    # 确保窗口不超过可用历史
+    strategy_draws = draws[:window_size] if len(draws) > window_size else draws
+    
     if strategy == "hot_v1":
         return _apply_weight_config(
-            draws, {"window": float(FEATURE_WINDOW_DEFAULT), "w_freq": 0.75, "w_omit": 0.05, "w_mom": 0.20}, "热号策略"
+            strategy_draws,
+            {"window": float(window_size), "w_freq": 0.78, "w_omit": 0.05, "w_mom": 0.17},
+            "热号策略"
         )
-    if strategy == "cold_rebound_v1":
+    
+    elif strategy == "cold_rebound_v1":
         return _apply_weight_config(
-            draws, {"window": float(FEATURE_WINDOW_DEFAULT), "w_freq": 0.05, "w_omit": 0.65, "w_mom": 0.30}, "冷号回补"
+            strategy_draws,
+            {"window": float(window_size), "w_freq": 0.05, "w_omit": 0.68, "w_mom": 0.27},
+            "冷号回补"
         )
-    if strategy == "momentum_v1":
+    
+    elif strategy == "momentum_v1":
         return _apply_weight_config(
-            draws, {"window": float(FEATURE_WINDOW_DEFAULT), "w_freq": 0.15, "w_omit": 0.0, "w_mom": 0.85}, "近期动量"
+            strategy_draws,
+            {"window": float(window_size), "w_freq": 0.12, "w_omit": 0.05, "w_mom": 0.83},
+            "近期动量"
         )
-    if strategy == "ensemble_v2":
-        if strategy_weights is None:
-            strategy_weights = {s: 1.0/len(STRATEGY_IDS) for s in STRATEGY_IDS}
-        return _ensemble_strategy(draws, mined_config, strategy_weights)
-    if strategy == "pattern_mined_v1":
+    
+    elif strategy == "balanced_v1":
+        return _apply_weight_config(
+            strategy_draws,
+            {
+                "window": float(window_size),
+                "w_freq": 0.40,
+                "w_omit": 0.30,
+                "w_mom": 0.20,
+                "w_pair": 0.05,
+                "w_zone": 0.05,
+            },
+            "组合策略",
+        )
+    
+    elif strategy == "pattern_mined_v1":
         cfg = mined_config or _default_mined_config()
-        return _apply_weight_config(draws, cfg, "规律挖掘")
+        cfg["window"] = float(window_size)          # 让规律挖掘也使用优化窗口
+        return _apply_weight_config(strategy_draws, cfg, "规律挖掘")
+    
+    elif strategy == "ensemble_v2":
+        # ensemble 使用统一最优窗口
+        if strategy_weights is None:
+            strategy_weights = {s: 1.0 / len(STRATEGY_IDS) for s in STRATEGY_IDS}
+        return _ensemble_strategy(strategy_draws, mined_config, strategy_weights)
+    
+    # 默认 fallback
     return _apply_weight_config(
-        draws,
+        strategy_draws,
         {
-            "window": float(FEATURE_WINDOW_DEFAULT),
+            "window": float(window_size),
             "w_freq": 0.40,
             "w_omit": 0.30,
             "w_mom": 0.20,
