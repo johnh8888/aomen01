@@ -35,8 +35,10 @@ ALL_NUMBERS = list(range(1, 50))
 # ==================== 窗口优化配置（已完成） ====================
 FEATURE_WINDOW_DEFAULT = 10          # 全局后备窗口
 
-# 各策略最优窗口（核心优化）
-STRATEGY_WINDOWS = {
+# ==================== 【优化后常量 - 请替换】 ====================
+FEATURE_WINDOW_DEFAULT = 10
+
+STRATEGY_BASE_WINDOWS = {
     "hot_v1": 6,
     "momentum_v1": 7,
     "cold_rebound_v1": 13,
@@ -44,6 +46,13 @@ STRATEGY_WINDOWS = {
     "pattern_mined_v1": 10,
     "ensemble_v2": 10,
 }
+
+WEIGHT_WINDOW_DEFAULT = 30
+HEALTH_WINDOW_DEFAULT = 18
+BACKTEST_ISSUES_DEFAULT = 120
+
+# Ensemble v3.1 配置
+ENSEMBLE_DIVERSITY_BONUS = 0.13
 
 # 多策略集成优化配置
 ENSEMBLE_VERSION = "v3"   # 可切换 v2 / v3 测试
@@ -974,23 +983,22 @@ def get_adaptive_strategy_window(strategy: str, conn: sqlite3.Connection) -> int
     return base
 
 
-def _ensemble_strategy_v3(
+def _ensemble_strategy_v3_1(
     draws: List[List[int]],
     mined_config: Optional[Dict[str, float]],
     strategy_weights: Dict[str, float],
     conn: sqlite3.Connection,
+    issue_no: str
 ) -> Tuple[List[Tuple[int, int, float, str]], int, float, Dict[int, float]]:
-    """多策略集成优化 v3：动态权重 + 自适应窗口 + 多样性奖励"""
+    """Ensemble v3.1 - 加强版"""
     sub_strategies = ["hot_v1", "cold_rebound_v1", "momentum_v1", "balanced_v1", "pattern_mined_v1"]
     score_maps = []
-    sub_picks = {}   # 用于计算多样性
+    sub_picks = {}
 
     for sub in sub_strategies:
-        # 1. 自适应窗口
         win_size = get_adaptive_strategy_window(sub, conn)
         sub_draws = draws[:win_size] if len(draws) > win_size else draws
-
-        # 2. 生成子策略得分
+        
         if sub == "pattern_mined_v1":
             cfg = mined_config or _default_mined_config()
             cfg["window"] = float(win_size)
@@ -1008,11 +1016,9 @@ def _ensemble_strategy_v3(
             _, _, _, score_map = _apply_weight_config(sub_draws, config, STRATEGY_LABELS.get(sub, sub))
         
         score_maps.append(score_map)
-        # 保存前6号用于多样性计算
         ranked = sorted(score_map.items(), key=lambda x: x[1], reverse=True)
         sub_picks[sub] = [n for n, _ in ranked[:6]]
 
-    # 3. 动态加权投票（使用最新保护权重）
     votes = {n: 0.0 for n in ALL_NUMBERS}
     for idx, sub in enumerate(sub_strategies):
         w = strategy_weights.get(sub, 0.2)
@@ -1020,24 +1026,62 @@ def _ensemble_strategy_v3(
         for rank, (n, _) in enumerate(ranked):
             votes[n] += w * (49 - rank)
 
-    # 4. 多样性奖励（关键优化）
-    diversity_score = {}
     for n in ALL_NUMBERS:
-        appear_count = sum(1 for picks in sub_picks.values() if n in picks)
-        diversity_score[n] = (6 - appear_count) * ENSEMBLE_DIVERSITY_BONUS   # 出现越少，奖励越高
-        votes[n] += diversity_score[n]
+        appear = sum(1 for p in sub_picks.values() if n in p)
+        votes[n] += (6 - appear) * ENSEMBLE_DIVERSITY_BONUS * 1.2
 
-    # 5. 最终归一化 + 二次精选
     voted = _normalize(votes)
-    picked = _pick_top_six(voted, "集成投票v3")
+    main_picked = _pick_top_six(voted, "集成投票v3.1")
 
-    # 特别号
-    main_set = {n for n, _, _, _ in picked}
-    candidates = [(n, s) for n, s in sorted(voted.items(), key=lambda x: x[1], reverse=True) if n not in main_set]
-    special_number, special_score = candidates[0] if candidates else (list(voted.keys())[0], 0.0)
+    main6 = [n for n, _, _, _ in main_picked]
+    special_number, confidence, defenses = _generate_special_number_v2(conn, main6, issue_no)
 
-    return picked, special_number, special_score, voted
+    return main_picked, special_number, confidence, voted
 
+def _generate_special_number_v2(
+    conn: sqlite3.Connection,
+    main_pool: List[int],
+    issue_no: str
+) -> Tuple[int, float, List[int]]:
+    """特别号独立模型 v2"""
+    special_votes = []
+    for strategy in STRATEGY_IDS:
+        run = conn.execute(
+            "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = ? AND status='PENDING'",
+            (issue_no, strategy)
+        ).fetchone()
+        if run:
+            _, sp = get_picks_for_run(conn, run["id"])
+            if sp is not None:
+                special_votes.append(sp)
+
+    vote_counter = Counter(special_votes)
+
+    # 历史遗漏
+    recent_specials = [int(r["special_number"]) for r in conn.execute(
+        "SELECT special_number FROM draws ORDER BY draw_date DESC LIMIT 60"
+    ).fetchall()]
+    
+    omission = {n: 40 for n in ALL_NUMBERS}
+    for i, num in enumerate(recent_specials):
+        omission[num] = min(omission.get(num, 40), i + 1)
+
+    scores = {}
+    main_set = set(main_pool)
+    for n in ALL_NUMBERS:
+        if n in main_set:
+            continue
+        score = vote_counter.get(n, 0) * 3.0
+        score += (40 - omission.get(n, 40)) * 0.65
+        score += (1 / (1 + omission.get(n, 40))) * 1.8
+        scores[n] = score
+
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    best = ranked[0][0]
+    confidence = min(1.0, ranked[0][1] / 12)
+    defenses = [n for n, _ in ranked[1:3]]
+
+    return best, round(confidence, 3), defenses
 
 def generate_strategy(
     draws: List[List[int]],
@@ -1619,6 +1663,7 @@ def print_recommendation_sheet(conn: sqlite3.Connection, limit: int = 8) -> None
 
 # ========== 动态权重相关函数 ==========
 def get_strategy_weights(conn: sqlite3.Connection, window: int = WEIGHT_WINDOW_DEFAULT) -> Dict[str, float]:
+    """最新版：规律挖掘强保护 + 平滑动态权重"""
     rows = conn.execute("""
         SELECT strategy, AVG(main_hit_count) as avg_hit
         FROM strategy_performance
@@ -1627,33 +1672,40 @@ def get_strategy_weights(conn: sqlite3.Connection, window: int = WEIGHT_WINDOW_D
         )
         GROUP BY strategy
     """, (window,)).fetchall()
+
     baseline = 0.6
     weights = {s: baseline for s in STRATEGY_IDS}
+
     for r in rows:
         strategy = str(r["strategy"])
         avg_hit = float(r["avg_hit"] or 0.0)
         if strategy in weights:
             weights[strategy] = max(avg_hit, baseline)
-    # 短期健康度抑制：近期持续走弱则自动降权
+
     health = get_strategy_health(conn, window=HEALTH_WINDOW_DEFAULT)
     for strategy, h in health.items():
         if strategy not in weights:
             continue
-        recent_avg_hit = float(h.get("recent_avg_hit", 0.0))
+        recent_avg = float(h.get("recent_avg_hit", 0.0))
         hit1_rate = float(h.get("hit1_rate", 0.0))
         cold_streak = int(h.get("cold_streak", 0))
+
         shrink = 1.0
-        if recent_avg_hit < 0.8:
-            shrink *= 0.85
-        if hit1_rate < 0.45:
-            shrink *= 0.85
+        if recent_avg < 0.7:
+            shrink *= 0.90 ** ((0.7 - recent_avg) * 8)
+        if hit1_rate < 0.52:
+            shrink *= 0.87
         if cold_streak >= 3:
-            shrink *= 0.80
-        weights[strategy] = max(0.05, weights[strategy] * shrink)
+            shrink *= 0.72
+
+        if strategy == "pattern_mined_v1" and (cold_streak >= 2 or recent_avg < 0.6):
+            shrink *= 0.48
+            print(f"[保护] 规律挖掘连挂 {cold_streak} 期，权重大幅下调")
+
+        weights[strategy] = max(0.08, weights[strategy] * shrink)
+
     total = sum(weights.values())
-    if total <= 0:
-        return {s: 1.0 / len(STRATEGY_IDS) for s in STRATEGY_IDS}
-    return {k: v / total for k, v in weights.items()}
+    return {k: round(v / total, 4) for k, v in weights.items()}
 
 
 def get_trio_weights(conn: sqlite3.Connection, window: int = WEIGHT_WINDOW_DEFAULT) -> Tuple[float, float, float]:
