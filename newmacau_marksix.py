@@ -1881,17 +1881,6 @@ def get_recent_two_zodiac_report(
     }
 
 
-def choose_zodiac_strategy_mode(conn: sqlite3.Connection) -> str:
-    triplet_report = get_recent_zodiac_triplet_report(conn, lookback=20, history_window=24)
-    two_hit_rate = float(triplet_report.get("two_hit_rate", 0.0))
-    samples = int(triplet_report.get("samples", 0.0))
-    if samples < 12:
-        return "single"
-    if two_hit_rate < 0.45:
-        return "single"
-    return "triplet"
-
-
 def get_top_two_zodiac_from_main(conn: sqlite3.Connection, window: int = 3) -> List[str]:
     rows = conn.execute(
         "SELECT numbers_json FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT ?",
@@ -2077,11 +2066,8 @@ def get_final_recommendation(conn: sqlite3.Connection):
 
     predict_trio = get_trio_from_merged_pool20(conn, issue_no)
 
-    zodiac_mode = choose_zodiac_strategy_mode(conn)
-    if zodiac_mode == "triplet":
-        zodiac_selection: Sequence[str] = get_zodiac_triplet_for_two_hits(conn, issue_no, window=24)
-    else:
-        zodiac_selection = [get_single_zodiac_pick(conn, issue_no, window=24)]
+    zodiac_single = get_single_zodiac_pick(conn, issue_no, window=24)
+    zodiac_two = get_two_zodiac_picks(conn, issue_no, window=24)
     return (
         issue_no,
         main6,
@@ -2092,8 +2078,8 @@ def get_final_recommendation(conn: sqlite3.Connection):
         predict_trio,
         special_defenses,
         special_conflict,
-        list(zodiac_selection),
-        zodiac_mode,
+        zodiac_single,
+        zodiac_two,
     )
 
 
@@ -2102,7 +2088,7 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     if not rec:
         print("\n最终推荐: (暂无有效预测)")
         return
-    issue_no, main6, special, pool10, pool14, pool20, predict_trio, special_defenses, special_conflict, zodiac_selection, zodiac_mode = rec
+    issue_no, main6, special, pool10, pool14, pool20, predict_trio, special_defenses, special_conflict, zodiac_single, zodiac_two = rec
     special_text = _fmt_num(special)
     p6 = " ".join(_fmt_num(n) for n in main6)
     p10 = " ".join(_fmt_num(n) for n in pool10)
@@ -2110,7 +2096,8 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     p20 = " ".join(_fmt_num(n) for n in pool20)
     trio_str = " ".join(_fmt_num(n) for n in predict_trio) if predict_trio else "无"
 
-    zodiac_text = "、".join(zodiac_selection) if zodiac_selection else "数据不足"
+    zodiac_single_text = zodiac_single if zodiac_single else "数据不足"
+    zodiac_two_text = "、".join(zodiac_two) if zodiac_two else "数据不足"
     defense_text = " ".join(_fmt_num(n) for n in special_defenses) if special_defenses else "无"
 
     print("\n" + "=" * 50)
@@ -2124,10 +2111,8 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     if special_conflict:
         print("特别号提示: 主推候选与主号冲突，已自动切换到非冲突号码")
     print(f"三中三预测（综合20码池+动态权重）: {trio_str}")
-    if zodiac_mode == "triplet":
-        print(f"🎯 三生肖推荐（2中主策略）: {zodiac_text}")
-    else:
-        print(f"🎯 单生肖推荐（1中风控模式）: {zodiac_text}")
+    print(f"🎯 2生肖推荐: {zodiac_two_text}")
+    print(f"🎯 1生肖推荐: {zodiac_single_text}")
     print("=" * 50)
 
 
@@ -2246,6 +2231,13 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
         f"命中率={zodiac_report['hit_rate'] * 100:.1f}% "
         f"最大连空={int(zodiac_report['max_miss_streak'])}"
     )
+    zodiac_two_report = get_recent_two_zodiac_report(conn, lookback=20, history_window=24)
+    print("双生肖复盘（最近20期）:")
+    print(
+        f"  - 最近样本={int(zodiac_two_report['samples'])}期 "
+        f"命中率={zodiac_two_report['hit_rate'] * 100:.1f}% "
+        f"最大连空={int(zodiac_two_report['max_miss_streak'])}"
+    )
 
     print_final_recommendation(conn)
 
@@ -2256,7 +2248,7 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
     if PUSHPLUS_TOKEN:
         rec = get_final_recommendation(conn)
         if rec:
-            issue_no, main6, special, _, _, _, predict_trio, special_defenses, special_conflict, zodiac_pick = rec
+            issue_no, main6, special, _, _, _, predict_trio, special_defenses, special_conflict, zodiac_single, zodiac_two = rec
             special_text = _fmt_num(special)
             trio_str = " ".join(_fmt_num(n) for n in predict_trio) if predict_trio else "无"
             defense_text = " ".join(_fmt_num(n) for n in special_defenses) if special_defenses else "无"
@@ -2280,12 +2272,14 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
             top_special_votes = get_top_special_votes(conn, issue_no, top_n=3)
             top_special_str = " ".join(_fmt_num(n) for n in top_special_votes) if top_special_votes else "无"
 
-            zodiac_text = zodiac_pick if zodiac_pick else "数据不足"
+            zodiac_single_text = zodiac_single if zodiac_single else "数据不足"
+            zodiac_two_text = "、".join(zodiac_two) if zodiac_two else "数据不足"
             conflict_tip = "（已避开主号冲突）" if special_conflict else ""
 
             content = (
                 f"【新澳门·{issue_no}期推荐】\n"
-                f"🎯 单生肖推荐：{zodiac_text}\n"
+                f"🎯 2生肖推荐：{zodiac_two_text}\n"
+                f"🎯 1生肖推荐：{zodiac_single_text}\n"
                 f"🔮 特别号主推：{special_text}{conflict_tip}\n"
                 f"🛡 特别号防守：{defense_text}\n"
                 f"📊 特别号综合汇总（各策略去重）：{all_specials_str}\n"
