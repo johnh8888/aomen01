@@ -32,7 +32,7 @@ API_RETRY_BACKOFF_SECONDS = 2.0
 MINED_CONFIG_KEY = "mined_strategy_config_v1"
 ALL_NUMBERS = list(range(1, 50))
 
-# ==================== 【优化后常量 - 请替换】 ====================
+# ==================== 【优化后常量】 ====================
 FEATURE_WINDOW_DEFAULT = 10
 
 STRATEGY_BASE_WINDOWS = {
@@ -50,6 +50,10 @@ BACKTEST_ISSUES_DEFAULT = 120
 
 # Ensemble v3.1 配置
 ENSEMBLE_DIVERSITY_BONUS = 0.13
+
+# 偏态检测阈值
+BIAS_THRESHOLD = 0.65
+BIAS_ADJUSTMENT = 0.45  # 偏态时冷号策略权重提升系数
 
 STRATEGY_LABELS = {
     "balanced_v1": "组合策略",
@@ -962,12 +966,82 @@ def get_adaptive_strategy_window(strategy: str, conn: sqlite3.Connection) -> int
     return base
 
 
-def _generate_special_number_v2(
+# ========== 偏态检测函数 ==========
+def detect_bias(conn: sqlite3.Connection, window: int = 10) -> Tuple[float, Dict[str, float]]:
+    """检测最近开奖是否偏态，返回偏态系数和详细指标"""
+    rows = conn.execute(
+        "SELECT numbers_json FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT ?",
+        (window,)
+    ).fetchall()
+    
+    if len(rows) < 5:
+        return 0.0, {}
+    
+    all_nums = []
+    for row in rows:
+        all_nums.extend(json.loads(row["numbers_json"]))
+    
+    # 1. 区间分布偏态
+    zone_dist = [0] * 5
+    for n in all_nums:
+        zone_dist[min(4, (n - 1) // 10)] += 1
+    expected = len(all_nums) / 5
+    zone_variance = sum((d - expected) ** 2 for d in zone_dist) / 5
+    zone_bias = min(1.0, zone_variance / 15)
+    
+    # 2. 奇偶比偏态
+    odd_count = sum(1 for n in all_nums if n % 2 == 1)
+    odd_ratio = odd_count / len(all_nums)
+    parity_bias = abs(odd_ratio - 0.5) * 2  # 0-1之间
+    
+    # 3. 冷热分布
+    freq = Counter(all_nums)
+    hot_count = sum(1 for f in freq.values() if f >= 3)
+    cold_count = sum(1 for f in freq.values() if f == 0)
+    hot_cold_ratio = hot_count / (cold_count + 1) if cold_count > 0 else hot_count
+    hot_cold_bias = min(1.0, abs(hot_cold_ratio - 1) / 2)
+    
+    # 综合偏态系数
+    bias_score = (zone_bias * 0.4 + parity_bias * 0.3 + hot_cold_bias * 0.3)
+    
+    return bias_score, {
+        "zone_bias": zone_bias,
+        "parity_bias": parity_bias,
+        "hot_cold_bias": hot_cold_bias,
+        "zone_dist": zone_dist,
+        "odd_ratio": odd_ratio
+    }
+
+
+def adjust_weights_for_bias(weights: Dict[str, float], bias_score: float) -> Dict[str, float]:
+    """根据偏态调整策略权重"""
+    if bias_score < BIAS_THRESHOLD:
+        return weights
+    
+    adjusted = weights.copy()
+    # 偏态时，冷号回补策略权重提升
+    cold_boost = 1 + BIAS_ADJUSTMENT * bias_score
+    adjusted["cold_rebound_v1"] = weights.get("cold_rebound_v1", 0.15) * cold_boost
+    
+    # 热号策略降权
+    adjusted["hot_v1"] = weights.get("hot_v1", 0.15) * (1 - BIAS_ADJUSTMENT * bias_score * 0.7)
+    adjusted["momentum_v1"] = weights.get("momentum_v1", 0.15) * (1 - BIAS_ADJUSTMENT * bias_score * 0.5)
+    
+    # 重新归一化
+    total = sum(adjusted.values())
+    if total > 0:
+        adjusted = {k: v / total for k, v in adjusted.items()}
+    
+    return adjusted
+
+
+# ========== 特别号 v3 增强版 ==========
+def _generate_special_number_v3(
     conn: sqlite3.Connection,
     main_pool: List[int],
     issue_no: str
 ) -> Tuple[int, float, List[int]]:
-    """特别号独立模型 v3 - 增强版：增加生肖周期 + 主号关联 + 冷热切换"""
+    """特别号独立模型 v3 - 增强版：生肖周期 + 主号关联 + 冷热切换 + 偏态适应"""
     
     # 1. 获取各策略的特别号投票
     special_votes = []
@@ -994,39 +1068,42 @@ def _generate_special_number_v2(
     
     # 4. 生肖周期分析（每12期一个循环）
     zodiac_cycle = []
-    for sp in recent_specials[:24]:  # 最近24期
+    for sp in recent_specials[:24]:
         zodiac_cycle.append(get_zodiac_by_number(sp))
     
-    # 预测下一个生肖（取最近3期的趋势）
+    # 预测下一个生肖（取最近3期的趋势 + 轮转逻辑）
     if len(zodiac_cycle) >= 6:
         recent_zodiacs = zodiac_cycle[:6]
-        # 找出现次数最少的生肖（轮转逻辑）
         zodiac_counter = Counter(recent_zodiacs)
+        # 找出现次数最少的生肖（轮转逻辑）
         least_zodiac = min(zodiac_counter.keys(), key=lambda z: zodiac_counter[z])
         predicted_zodiac_numbers = ZODIAC_MAP.get(least_zodiac, [1, 13, 25, 37, 49])
     else:
         predicted_zodiac_numbers = ALL_NUMBERS
     
     # 5. 主号关联模式分析
-    # 统计特别号与主号的关系（差值、倍数、尾数等）
     main_relations = []
     rows = conn.execute(
         "SELECT numbers_json, special_number FROM draws ORDER BY draw_date DESC LIMIT 30"
     ).fetchall()
     
+    relation_stats = {"near": 0, "same_tail": 0, "adjacent": 0}
     for row in rows:
         main_nums = json.loads(row["numbers_json"])
         special = int(row["special_number"])
         for mn in main_nums:
             diff = abs(special - mn)
-            if 1 <= diff <= 5:  # 特别号与主号相差1-5
-                main_relations.append(("near", diff))
-            elif special % 10 == mn % 10:  # 同尾数
-                main_relations.append(("same_tail", mn % 10))
-            elif special == mn + 1 or special == mn - 1:  # 相邻
-                main_relations.append(("adjacent", mn))
+            if 1 <= diff <= 5:
+                relation_stats["near"] += 1
+            if special % 10 == mn % 10:
+                relation_stats["same_tail"] += 1
+            if special == mn + 1 or special == mn - 1:
+                relation_stats["adjacent"] += 1
     
-    # 6. 计算综合得分
+    # 6. 偏态检测（影响特别号策略）
+    bias_score, bias_details = detect_bias(conn, window=10)
+    
+    # 7. 计算综合得分
     main_set = set(main_pool)
     scores = {}
     
@@ -1036,56 +1113,70 @@ def _generate_special_number_v2(
         
         score = 0.0
         
-        # 6.1 投票得分（权重最高）
-        score += vote_counter.get(n, 0) * 4.0
+        # 7.1 投票得分（权重最高）
+        score += vote_counter.get(n, 0) * 4.5
         
-        # 6.2 遗漏得分（越冷越高，但要防止过度追冷）
+        # 7.2 遗漏得分（越冷越高）
         omission_score = (60 - omission.get(n, 60)) / 60.0
-        # 冷号阈值：遗漏超过15期开始加分
         if omission.get(n, 60) > 15:
-            score += omission_score * 2.5
+            score += omission_score * 3.0
         else:
-            score += omission_score * 1.0
+            score += omission_score * 1.2
         
-        # 6.3 热号衰减（最近5期出过的特别号降权）
+        # 7.3 热号衰减（最近5期出过的特别号降权）
         if n in recent_specials[:5]:
-            score *= 0.6
+            score *= 0.55
+        elif n in recent_specials[5:10]:
+            score *= 0.85
         
-        # 6.4 生肖周期加分
+        # 7.4 生肖周期加分
         if n in predicted_zodiac_numbers:
-            score += 1.5
+            score += 1.8
         
-        # 6.5 与主号的关联加分（主号±1~3）
+        # 7.5 与主号的关联加分
         for mn in main_pool:
             diff = abs(n - mn)
             if diff == 1:
-                score += 1.2
+                score += 1.5
             elif diff == 2:
-                score += 0.8
+                score += 1.0
             elif diff == 3:
-                score += 0.5
-            elif n % 10 == mn % 10 and n != mn:  # 同尾数
-                score += 0.6
+                score += 0.7
+            elif n % 10 == mn % 10 and n != mn:
+                score += 0.8
         
-        # 6.6 奇偶平衡（最近5期特别号奇偶统计）
+        # 7.6 历史关联模式加分
+        if relation_stats["near"] > 10:
+            for mn in main_pool:
+                if 1 <= abs(n - mn) <= 3:
+                    score += 0.5
+        if relation_stats["same_tail"] > 8:
+            for mn in main_pool:
+                if n % 10 == mn % 10:
+                    score += 0.4
+        
+        # 7.7 奇偶平衡
         recent_parity = [sp % 2 for sp in recent_specials[:5]]
         if len(recent_parity) >= 3:
             odd_ratio = sum(recent_parity) / len(recent_parity)
-            if odd_ratio > 0.6 and n % 2 == 0:  # 最近偏奇，推荐偶
-                score += 0.8
-            elif odd_ratio < 0.4 and n % 2 == 1:  # 最近偏偶，推荐奇
-                score += 0.8
+            if odd_ratio > 0.6 and n % 2 == 0:
+                score += 1.0
+            elif odd_ratio < 0.4 and n % 2 == 1:
+                score += 1.0
+        
+        # 7.8 偏态适应：偏态时增加冷号权重
+        if bias_score > BIAS_THRESHOLD:
+            if omission.get(n, 60) > 10:
+                score *= (1 + bias_score * 0.5)
         
         scores[n] = score
     
-    # 7. 排序并返回
+    # 8. 排序并返回
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     
-    # 主推：最高分
     best = ranked[0][0]
-    confidence = min(1.0, ranked[0][1] / 15)
+    confidence = min(1.0, ranked[0][1] / 18)
     
-    # 防守：2-4名，排除与主号冲突的
     defenses = []
     for n, s in ranked[1:]:
         if n not in main_set and n != best:
@@ -1093,14 +1184,101 @@ def _generate_special_number_v2(
             if len(defenses) >= 3:
                 break
     
-    # 额外：如果防守不足3个，从高分中补充
     while len(defenses) < 3:
         for n, s in ranked:
             if n not in defenses and n != best and n not in main_set:
                 defenses.append(n)
                 break
     
+    # 打印偏态信息（调试用）
+    if bias_score > BIAS_THRESHOLD:
+        print(f"[偏态检测] 偏态系数={bias_score:.2f}，已启用偏态适应策略", flush=True)
+    
     return best, round(confidence, 3), defenses[:3]
+
+
+# ========== 三中三优化版 ==========
+def get_trio_from_merged_pool20_v2(conn: sqlite3.Connection, issue_no: str) -> List[int]:
+    """三中三预测 v2 - 从各策略差异号中选取"""
+    
+    # 获取所有策略的20码池
+    all_pools = []
+    strategy_pools = {}
+    
+    for strategy in STRATEGY_IDS:
+        run = conn.execute(
+            "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = ? AND status='PENDING'",
+            (issue_no, strategy)
+        ).fetchone()
+        if run:
+            pool20 = get_pool_numbers_for_run(conn, run["id"], 20)
+            all_pools.extend(pool20)
+            strategy_pools[strategy] = set(pool20)
+    
+    if len(all_pools) < 3:
+        return [1, 2, 3]
+    
+    # 统计每个号码出现在多少个策略中
+    appearance_count = Counter(all_pools)
+    
+    # 找出差异号（只出现在1-2个策略中的号码）
+    diff_numbers = [n for n, c in appearance_count.items() if 1 <= c <= 2]
+    
+    # 如果没有足够的差异号，使用低频号
+    if len(diff_numbers) < 6:
+        diff_numbers = [n for n, c in appearance_count.items() if c <= 3]
+    
+    # 获取近期开奖数据用于评分
+    draws = load_recent_draws(conn, FEATURE_WINDOW_DEFAULT)
+    if len(draws) < 3:
+        return diff_numbers[:3] if len(diff_numbers) >= 3 else [1, 2, 3]
+    
+    # 评分差异号
+    momentum = _momentum_map(draws)
+    freq = _freq_map(draws)
+    omission = _omission_map(draws)
+    momentum_norm = _normalize(momentum)
+    freq_norm = _normalize(freq)
+    omission_norm = _normalize(omission)
+    
+    w_mom, w_hot, w_cold = get_trio_weights(conn, window=WEIGHT_WINDOW_DEFAULT)
+    
+    scores = {}
+    for n in diff_numbers[:15]:  # 只考虑前15个差异号
+        score = (w_mom * momentum_norm.get(n, 0) +
+                 w_hot * freq_norm.get(n, 0) +
+                 w_cold * omission_norm.get(n, 0))
+        # 差异号额外加分
+        score += (6 - appearance_count.get(n, 3)) * 0.15
+        scores[n] = score
+    
+    sorted_nums = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    candidates = [n for n, _ in sorted_nums[:10]]
+    
+    def is_valid(trio):
+        odd_cnt = sum(1 for x in trio if x % 2 == 1)
+        total = sum(trio)
+        return 1 <= odd_cnt <= 2 and 80 <= total <= 130
+    
+    # 从候选号中找有效三中三
+    for i in range(len(candidates)):
+        for j in range(i+1, len(candidates)):
+            for k in range(j+1, len(candidates)):
+                trio = (candidates[i], candidates[j], candidates[k])
+                if is_valid(trio):
+                    return list(trio)
+    
+    # 放宽约束再试
+    for i in range(len(candidates)):
+        for j in range(i+1, len(candidates)):
+            for k in range(j+1, len(candidates)):
+                trio = (candidates[i], candidates[j], candidates[k])
+                odd_cnt = sum(1 for x in trio if x % 2 == 1)
+                if 1 <= odd_cnt <= 2:
+                    return list(trio)
+    
+    return [candidates[0], candidates[1], candidates[2]] if len(candidates) >= 3 else [1, 2, 3]
+
 
 def _ensemble_strategy_v3_1(
     draws: List[List[int]],
@@ -1109,10 +1287,17 @@ def _ensemble_strategy_v3_1(
     conn: sqlite3.Connection,
     issue_no: str
 ) -> Tuple[List[Tuple[int, int, float, str]], int, float, Dict[int, float]]:
-    """Ensemble v3.1 - 加强版"""
+    """Ensemble v3.1 - 加强版（集成偏态检测）"""
     sub_strategies = ["hot_v1", "cold_rebound_v1", "momentum_v1", "balanced_v1", "pattern_mined_v1"]
     score_maps = []
     sub_picks = {}
+
+    # 检测偏态并调整权重
+    bias_score, bias_details = detect_bias(conn, window=10)
+    adjusted_weights = adjust_weights_for_bias(strategy_weights, bias_score)
+    
+    if bias_score > BIAS_THRESHOLD:
+        print(f"[集成策略] 偏态模式激活，偏态系数={bias_score:.2f}", flush=True)
 
     for sub in sub_strategies:
         win_size = get_adaptive_strategy_window(sub, conn)
@@ -1140,7 +1325,7 @@ def _ensemble_strategy_v3_1(
 
     votes = {n: 0.0 for n in ALL_NUMBERS}
     for idx, sub in enumerate(sub_strategies):
-        w = strategy_weights.get(sub, 0.2)
+        w = adjusted_weights.get(sub, 0.2)
         ranked = sorted(score_maps[idx].items(), key=lambda x: x[1], reverse=True)
         for rank, (n, _) in enumerate(ranked):
             votes[n] += w * (49 - rank)
@@ -1153,7 +1338,7 @@ def _ensemble_strategy_v3_1(
     main_picked = _pick_top_six(voted, "集成投票v3.1")
 
     main6 = [n for n, _, _, _ in main_picked]
-    special_number, confidence, defenses = _generate_special_number_v2(conn, main6, issue_no)
+    special_number, confidence, defenses = _generate_special_number_v3(conn, main6, issue_no)
 
     return main_picked, special_number, confidence, voted
 
@@ -1167,10 +1352,7 @@ def generate_strategy(
     issue_no: Optional[str] = None,
 ) -> Tuple[List[Tuple[int, int, float, str]], int, float, Dict[int, float]]:
     
-    # === 策略专用窗口（核心优化点）===
     window_size = STRATEGY_BASE_WINDOWS.get(strategy, FEATURE_WINDOW_DEFAULT)
-    
-    # 确保窗口不超过可用历史
     strategy_draws = draws[:window_size] if len(draws) > window_size else draws
     
     if strategy == "hot_v1":
@@ -1222,7 +1404,6 @@ def generate_strategy(
             raise ValueError("ensemble_v2/v3 requires issue_no parameter")
         return _ensemble_strategy_v3_1(strategy_draws, mined_config, strategy_weights, conn, issue_no)
     
-    # 默认 fallback
     return _apply_weight_config(
         strategy_draws,
         {
@@ -1741,7 +1922,7 @@ def print_recommendation_sheet(conn: sqlite3.Connection, limit: int = 8) -> None
 
 # ========== 动态权重相关函数 ==========
 def get_strategy_weights(conn: sqlite3.Connection, window: int = WEIGHT_WINDOW_DEFAULT) -> Dict[str, float]:
-    """最新版：规律挖掘强保护 + 平滑动态权重 + 特别号保护"""
+    """最新版：规律挖掘强保护 + 平滑动态权重"""
     rows = conn.execute("""
         SELECT strategy, AVG(main_hit_count) as avg_hit
         FROM strategy_performance
@@ -2259,22 +2440,8 @@ def score_numbers_for_trio(conn: sqlite3.Connection, candidate_numbers: List[int
 
 
 def get_trio_from_merged_pool20(conn: sqlite3.Connection, issue_no: str) -> List[int]:
-    merged_pool = get_merged_pool20(conn, issue_no)
-    if len(merged_pool) < 3:
-        return merged_pool[:3] if merged_pool else [1, 2, 3]
-    scores = score_numbers_for_trio(conn, merged_pool)
-    sorted_nums = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-    candidates = [n for n, _ in sorted_nums[:10]]
-    def is_valid(trio):
-        odd_cnt = sum(1 for x in trio if x % 2 == 1)
-        return 1 <= odd_cnt <= 2
-    for i in range(len(candidates)):
-        for j in range(i+1, len(candidates)):
-            for k in range(j+1, len(candidates)):
-                trio = (candidates[i], candidates[j], candidates[k])
-                if is_valid(trio):
-                    return list(trio)
-    return [candidates[0], candidates[1], candidates[2]]
+    """三中三预测 - 使用优化版v2"""
+    return get_trio_from_merged_pool20_v2(conn, issue_no)
 
 
 # ========== 最终推荐函数 ==========
