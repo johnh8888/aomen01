@@ -52,9 +52,8 @@ BACKTEST_ISSUES_DEFAULT = 120
 ENSEMBLE_DIVERSITY_BONUS = 0.13
 
 # 偏态检测阈值
-BIAS_THRESHOLD = 0.60
-BIAS_ADJUSTMENT = 0.48
-FORCED_BIAS_COEFFICIENT = 0.75
+BIAS_THRESHOLD = 0.65
+BIAS_ADJUSTMENT = 0.45
 
 STRATEGY_LABELS = {
     "balanced_v1": "组合策略",
@@ -962,54 +961,22 @@ def get_adaptive_strategy_window(strategy: str, conn: sqlite3.Connection) -> int
     return base
 
 
+# ========== 偏态检测函数（强制偏态模式） ==========
 def detect_bias(conn: sqlite3.Connection, window: int = 10) -> Tuple[float, Dict[str, float]]:
-    """偏态检测 + 强制偏态模式"""
-    # ====================== 强制偏态模式 ======================
-    # 如果你想每次都强制使用 0.75 的偏态系数，取消下面这行的注释即可
-    # return FORCED_BIAS_COEFFICIENT, {"forced": True, "zone_bias": 0.8, "parity_bias": 0.7, "hot_cold_bias": 0.75}
-    
-    rows = conn.execute(
-        "SELECT numbers_json FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT ?",
-        (window,)
-    ).fetchall()
-    
-    if len(rows) < 5:
-        return FORCED_BIAS_COEFFICIENT, {"forced": True}   # 数据不足时也强制偏态
-
-    all_nums = []
-    for row in rows:
-        all_nums.extend(json.loads(row["numbers_json"]))
-
-    zone_dist = [0] * 5
-    for n in all_nums:
-        zone_dist[min(4, (n - 1) // 10)] += 1
-
-    expected = len(all_nums) / 5
-    zone_variance = sum((d - expected) ** 2 for d in zone_dist) / 5
-    zone_bias = min(1.0, zone_variance / 15)
-
-    odd_count = sum(1 for n in all_nums if n % 2 == 1)
-    odd_ratio = odd_count / len(all_nums)
-    parity_bias = abs(odd_ratio - 0.5) * 2
-
-    freq = Counter(all_nums)
-    hot_count = sum(1 for n in ALL_NUMBERS if freq.get(n, 0) >= 3)
-    cold_count = sum(1 for n in ALL_NUMBERS if freq.get(n, 0) == 0)
-    hot_cold_ratio = hot_count / (cold_count + 1) if cold_count > 0 else hot_count
-    hot_cold_bias = min(1.0, abs(hot_cold_ratio - 1) / 2)
-
-    bias_score = (zone_bias * 0.4 + parity_bias * 0.3 + hot_cold_bias * 0.3)
-
-    # 强制上限，最多显示 0.75（符合你的要求）
-    bias_score = min(0.75, max(bias_score, 0.55))   # 确保至少显示 0.55，最高 0.75
-
-    return bias_score, {
-        "zone_bias": zone_bias,
-        "parity_bias": parity_bias,
-        "hot_cold_bias": hot_cold_bias,
-        "zone_dist": zone_dist,
-        "odd_ratio": odd_ratio
+    """
+    强制偏态模式：始终返回固定偏态系数 0.8
+    如需调整系数，修改下方 return 语句中的数值即可（建议范围 0.75 ~ 0.85）
+    """
+    # 固定偏态系数 0.8，模拟的偏态分解值（仅用于日志显示）
+    return 0.8, {
+        "forced": True,           # 标记为强制模式
+        "zone_bias": 0.8,         # 区间偏态模拟值
+        "parity_bias": 0.7,       # 奇偶偏态模拟值
+        "hot_cold_bias": 0.75,    # 冷热偏态模拟值
+        "zone_dist": [0, 0, 0, 0, 0],   # 占位
+        "odd_ratio": 0.5                # 占位
     }
+
 
 def adjust_weights_for_bias(weights: Dict[str, float], bias_score: float) -> Dict[str, float]:
     if bias_score < BIAS_THRESHOLD:
@@ -1216,17 +1183,10 @@ def _ensemble_strategy_v3_1(
     sub_strategies = ["hot_v1", "cold_rebound_v1", "momentum_v1", "balanced_v1", "pattern_mined_v1"]
     score_maps = []
     sub_picks = {}
-    
-    # 偏态检测
     bias_score, _ = detect_bias(conn, window=10)
     adjusted_weights = adjust_weights_for_bias(strategy_weights, bias_score)
-    
     if bias_score > BIAS_THRESHOLD:
-        print(f"[集成策略] 🔥 偏态模式激活，偏态系数={bias_score:.2f} 🔥", flush=True)
-        if bias_score >= 0.73:
-            print("   → 当前处于强偏态状态，冷号回补权重已显著提升！", flush=True)
-    else:
-        print(f"[集成策略] 正常模式，偏态系数={bias_score:.2f}", flush=True)
+        print(f"[集成策略] 偏态模式激活，偏态系数={bias_score:.2f}", flush=True)
 
     for sub in sub_strategies:
         win_size = get_adaptive_strategy_window(sub, conn)
