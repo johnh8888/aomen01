@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+!/usr/bin/env python3
 from __future__ import annotations
 
 import argparse
@@ -49,7 +49,7 @@ HEALTH_WINDOW_DEFAULT = 18
 BACKTEST_ISSUES_DEFAULT = 120
 
 # Ensemble v3.1 配置
-ENSEMBLE_DIVERSITY_BONUS = 0.13
+ENSEMBLE_DIVERSITY_BONUS = 0.18
 
 # 偏态检测阈值（已调整）
 BIAS_THRESHOLD = 0.65
@@ -948,6 +948,19 @@ def get_adaptive_strategy_window(strategy: str, conn: sqlite3.Connection) -> int
     recent_avg = float(h.get("recent_avg_hit", 0.65))
     cold_streak = int(h.get("cold_streak", 0))
 
+    # 冷号回补特殊处理：统计长期遗漏号码数量
+    if strategy == "cold_rebound_v1":
+        rows = conn.execute(
+            "SELECT numbers_json FROM draws ORDER BY draw_date DESC LIMIT 60"
+        ).fetchall()
+        all_nums = []
+        for r in rows:
+            all_nums.extend(json.loads(r["numbers_json"]))
+        freq = Counter(all_nums)
+        cold_count = sum(1 for n in ALL_NUMBERS if freq.get(n, 0) == 0)
+        if cold_count >= 5:   # 遗漏≥60期的号码超过5个
+            return min(20, base + 8)   # 大幅扩大窗口
+
     if recent_avg >= 0.95:
         return max(5, base - 2)
     elif recent_avg >= 0.80:
@@ -1026,8 +1039,18 @@ def _generate_special_number_v4(
 
     main_zones_set = {(m - 1) // 10 for m in main_pool}
     main_set = set(main_pool)
-    scores = {}
 
+    # === 新增：主号生肖缺失补偿分析 ===
+    recent_main_zodiacs = []
+    for row in conn.execute(
+        "SELECT numbers_json FROM draws ORDER BY draw_date DESC LIMIT 2"
+    ).fetchall():
+        for n in json.loads(row["numbers_json"]):
+            recent_main_zodiacs.append(get_zodiac_by_number(n))
+    missing_zodiacs = set(ZODIAC_MAP.keys()) - set(recent_main_zodiacs[-12:]) if len(recent_main_zodiacs) >= 12 else set()
+    # ===================================
+
+    scores = {}
     for n in ALL_NUMBERS:
         if n in main_set:
             continue
@@ -1066,6 +1089,12 @@ def _generate_special_number_v4(
                 score += 1.0
             elif odd_ratio < 0.4 and n % 2 == 1:
                 score += 1.0
+
+        # === 新增：主号生肖缺失补偿加分 ===
+        if missing_zodiacs and get_zodiac_by_number(n) in missing_zodiacs:
+            score += 3.0
+        # ================================
+
         scores[n] = score
 
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
@@ -1084,7 +1113,6 @@ def _generate_special_number_v4(
                 break
 
     return best, round(confidence, 3), defenses[:3]
-
 
 # ========== 三中三优化版 v2 ==========
 def get_trio_from_merged_pool20_v2(conn: sqlite3.Connection, issue_no: str) -> List[int]:
