@@ -1935,6 +1935,7 @@ def _select_single_zodiac_from_scores(zodiac_scores: Dict[str, float]) -> str:
 
 
 def get_single_zodiac_pick(conn: sqlite3.Connection, issue_no: str, window: int = 24) -> str:
+    """单生肖推荐 v3 - 优先从双生肖中选取（双生肖函数不变）"""
     rows = conn.execute(
         "SELECT numbers_json, special_number FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT ?",
         (window,)
@@ -1944,70 +1945,48 @@ def get_single_zodiac_pick(conn: sqlite3.Connection, issue_no: str, window: int 
     
     zodiac_scores = _build_zodiac_scores_from_rows(rows)
     
-    # 获取双生肖推荐作为强约束
-    two_zodiac = get_two_zodiac_picks(conn, issue_no, window)
-    
     # 获取20码池和特别号投票
     _, _, _, pool20, _ = _weighted_consensus_pools(conn, issue_no)
     top_special_votes = get_top_special_votes(conn, issue_no, top_n=3)
     
-    # 1. 生肖周期轮动（加强冷门补偿）
+    # 生肖周期轮动
     recent_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:12]]
     zodiac_cycle_counter = Counter(recent_zodiacs)
     if zodiac_cycle_counter:
         coldest_zodiac = min(zodiac_cycle_counter.keys(), key=lambda z: zodiac_cycle_counter[z])
-        zodiac_scores[coldest_zodiac] += 2.5   # 从2.0提高到2.5
+        zodiac_scores[coldest_zodiac] += 2.0
     
-    # 2. 20码池关联（大幅提高）
+    # 20码池关联
     if pool20:
         pool_zodiacs = [get_zodiac_by_number(n) for n in pool20]
         pool_zodiac_counter = Counter(pool_zodiacs)
         for z, cnt in pool_zodiac_counter.items():
-            zodiac_scores[z] += cnt * 0.5     # 从0.35提高到0.5
+            zodiac_scores[z] += cnt * 0.35
     
-    # 3. 特别号投票关联（大幅提高）
+    # 特别号投票关联
     if top_special_votes:
         special_zodiacs = [get_zodiac_by_number(n) for n in top_special_votes]
         for z in special_zodiacs:
-            zodiac_scores[z] += 2.0           # 从1.5提高到2.0
+            zodiac_scores[z] += 1.5
     
-    # 4. 近期降权（近期出现过的生肖大幅降权）
+    # 近期降权
     last_3_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:3]]
     for z in last_3_zodiacs:
-        zodiac_scores[z] -= 1.0               # 从0.6提高到1.0
+        zodiac_scores[z] -= 0.6
     
-    # 5. 双生肖强约束：单生肖必须从双生肖中选择（如果双生肖命中率高）
-    # 先给双生肖中的每个生肖加高分
-    for z in two_zodiac:
-        zodiac_scores[z] += 3.0               # 强制引导到双生肖
+    # 获取双生肖推荐（调用原有函数，保持不变）
+    two_zodiac = get_two_zodiac_picks(conn, issue_no, window)
     
+    # 按得分排序
     ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
     
-    # 如果top1已经在双生肖中，直接返回；否则检查top2是否在双生肖中
-    if ranked[0][0] in two_zodiac:
-        return ranked[0][0]
-    for candidate, _ in ranked[1:]:
+    # 优先选择双生肖中的生肖
+    for candidate, _ in ranked:
         if candidate in two_zodiac:
             return candidate
-    # 兜底
+    
+    # 降级：返回第一名
     return ranked[0][0]
-
-
-def get_two_zodiac_picks(conn: sqlite3.Connection, issue_no: str, window: int = 24) -> List[str]:
-    rows = conn.execute(
-        "SELECT numbers_json, special_number FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT ?",
-        (window,),
-    ).fetchall()
-    if not rows:
-        return ["马", "蛇"]
-    zodiac_scores = _build_zodiac_scores_from_rows(rows)
-    _, _, _, pool20, _ = _weighted_consensus_pools(conn, issue_no)
-    if pool20:
-        for idx, n in enumerate(pool20):
-            boost = (20 - idx) / 20.0
-            zodiac_scores[get_zodiac_by_number(int(n))] += 0.9 * boost
-    ranked = [z for z, _ in sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))]
-    return ranked[:2] if len(ranked) >= 2 else ["马", "蛇"]
 
 
 def get_recent_zodiac_triplet_report(
