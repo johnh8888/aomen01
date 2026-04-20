@@ -2027,7 +2027,7 @@ def get_two_zodiac_picks(conn: sqlite3.Connection, issue_no: str, window: int = 
     omission_map = _zodiac_omission_map(rows)
     force_include = []
     for z, omit in omission_map.items():
-        if omit >= 12:
+        if omit >= 8:
             zodiac_scores[z] = max(zodiac_scores[z], 999.0)  # 确保必选
             force_include.append(z)
 
@@ -2078,7 +2078,7 @@ def get_two_zodiac_picks(conn: sqlite3.Connection, issue_no: str, window: int = 
                 prev_zodiacs.append(get_zodiac_by_number(prev_draw["special_number"]))
                 hot_prev = Counter(prev_zodiacs).most_common(2)
                 for z, _ in hot_prev:
-                    zodiac_scores[z] += 8.0  # 大幅加分确保入选
+                    zodiac_scores[z] += 20.0  # 大幅加分确保入选
 
     # 8. 强制包含遗漏保护的生肖
     ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
@@ -2091,6 +2091,16 @@ def get_two_zodiac_picks(conn: sqlite3.Connection, issue_no: str, window: int = 
             break
         if z not in picks:
             picks.append(z)
+
+    # ---- 上期未命中补偿 ----
+    if not prev_hit and recent_special_zodiacs:
+        must_zodiac = recent_special_zodiacs[0]
+        if must_zodiac not in picks:
+            if len(picks) >= 2:
+                picks[-1] = must_zodiac
+            else:
+                picks.append(must_zodiac)
+    # -----------------------
 
     return picks[:2] if len(picks) >= 2 else ["马", "蛇"]
 
