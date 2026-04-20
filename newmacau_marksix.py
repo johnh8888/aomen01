@@ -1943,61 +1943,7 @@ def get_strategy_health(conn: sqlite3.Connection, window: int = HEALTH_WINDOW_DE
     return health
 
 
-# ==================== 新版生肖预测增强模块 v3.0 ====================
-# 替换原有生肖相关函数，直接复制覆盖即可使用
-# 包含功能：动态窗口、遗漏表、内部号码热度、周期检测、转移概率、相容性过滤、
-#          主号→特别号矩阵、在线权重学习（可选）
-
-import math
-from collections import defaultdict
-from typing import Dict, List, Optional, Sequence, Tuple, Set
-
-# 生肖映射（保持不变）
-ZODIAC_MAP = {
-    "马": [1, 13, 25, 37, 49],
-    "蛇": [2, 14, 26, 38],
-    "龙": [3, 15, 27, 39],
-    "兔": [4, 16, 28, 40],
-    "虎": [5, 17, 29, 41],
-    "牛": [6, 18, 30, 42],
-    "鼠": [7, 19, 31, 43],
-    "猪": [8, 20, 32, 44],
-    "狗": [9, 21, 33, 45],
-    "鸡": [10, 22, 34, 46],
-    "猴": [11, 23, 35, 47],
-    "羊": [12, 24, 36, 48],
-}
-
-# 生肖关系表（用于相容性过滤）
-ZODIAC_RELATIONS = {
-    "六合": [("鼠", "牛"), ("虎", "猪"), ("兔", "狗"), ("龙", "鸡"), ("蛇", "猴"), ("马", "羊")],
-    "三合": [("猴", "鼠", "龙"), ("蛇", "鸡", "牛"), ("虎", "马", "狗"), ("猪", "兔", "羊")],
-    "六冲": [("鼠", "马"), ("牛", "羊"), ("虎", "猴"), ("兔", "鸡"), ("龙", "狗"), ("蛇", "猪")],
-}
-
-# 在线学习权重（全局状态，运行时动态更新）
-_ZODIAC_FEATURE_WEIGHTS = {
-    "freq": 1.0,
-    "omission": 1.0,
-    "transition": 1.0,
-    "cycle": 1.0,
-    "internal_heat": 1.0,
-    "compatibility": 1.0,
-    "main_to_special": 1.0,
-}
-_LEARNING_RATE = 0.03
-_LAST_PREDICTION_FEATURES: Dict[str, Dict[str, float]] = {}  # 存储上期预测特征用于更新
-
-
-def _zodiac_to_index(z: str) -> int:
-    """将生肖转为0-11的索引"""
-    return list(ZODIAC_MAP.keys()).index(z)
-
-
-def _index_to_zodiac(idx: int) -> str:
-    return list(ZODIAC_MAP.keys())[idx % 12]
-
-
+# ========== 生肖相关函数（优化版） ==========
 def get_zodiac_by_number(number: int) -> str:
     for zodiac, nums in ZODIAC_MAP.items():
         if number in nums:
@@ -2005,423 +1951,216 @@ def get_zodiac_by_number(number: int) -> str:
     return "马"
 
 
-# ---------- 辅助特征函数 ----------
-def build_zodiac_omission_map(rows: Sequence[sqlite3.Row], current_idx: Optional[int] = None) -> Dict[str, int]:
-    """计算每个生肖的遗漏期数（距离最近一次出现在主号或特别号）"""
-    omission = {z: 999 for z in ZODIAC_MAP}
-    end = current_idx if current_idx is not None else len(rows)
-    for i in range(end - 1, -1, -1):
-        row = rows[i]
-        nums = json.loads(row["numbers_json"])
-        sp = int(row["special_number"])
-        appeared = set(get_zodiac_by_number(n) for n in nums)
-        appeared.add(get_zodiac_by_number(sp))
-        for z in appeared:
-            if omission[z] == 999:
-                omission[z] = end - 1 - i
-    return omission
-
-
-def get_zodiac_internal_heat(rows: Sequence[sqlite3.Row], window: int = 20) -> Dict[str, float]:
-    """生肖内部号码热度：反映该生肖的号码是否集中于少数热号"""
-    heat = {z: 0.0 for z in ZODIAC_MAP}
-    if len(rows) < 3:
-        return heat
-    recent = rows[-window:] if len(rows) >= window else rows
-    for zodiac, nums in ZODIAC_MAP.items():
-        cnt = {n: 0 for n in nums}
-        total = 0
-        for row in recent:
-            draw_nums = json.loads(row["numbers_json"])
-            sp = int(row["special_number"])
-            for n in draw_nums + [sp]:
-                if n in nums:
-                    cnt[n] += 1
-                    total += 1
-        if total > 0:
-            max_cnt = max(cnt.values())
-            heat[zodiac] = max_cnt / total
-    return heat
-
-
-def detect_zodiac_periodicity(rows: Sequence[sqlite3.Row], max_lag: int = 12) -> Tuple[Optional[int], float]:
-    """检测特别号生肖序列的自相关周期，返回(最佳滞后阶数, 相关系数)"""
-    if len(rows) < max_lag * 3:
-        return None, 0.0
-    special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows]
-    idx_seq = [_zodiac_to_index(z) for z in special_zodiacs]
-    n = len(idx_seq)
-    mean = sum(idx_seq) / n
-    var = sum((x - mean) ** 2 for x in idx_seq)
-    if var == 0:
-        return None, 0.0
-    best_lag, best_acf = None, 0.0
-    for lag in range(1, max_lag + 1):
-        cov = sum((idx_seq[i] - mean) * (idx_seq[i - lag] - mean) for i in range(lag, n))
-        acf = cov / var
-        if abs(acf) > abs(best_acf):
-            best_acf = acf
-            best_lag = lag
-    return best_lag, best_acf
-
-
-def build_zodiac_transition_matrix(rows: Sequence[sqlite3.Row], max_history: int = 200) -> Dict[str, Dict[str, float]]:
-    """上期特别号生肖 → 本期特别号生肖的条件概率"""
-    matrix = {z: {z2: 0.0 for z2 in ZODIAC_MAP} for z in ZODIAC_MAP}
-    counts = {z: 0 for z in ZODIAC_MAP}
-    start = max(0, len(rows) - max_history)
-    for i in range(start + 1, len(rows)):
-        prev_z = get_zodiac_by_number(int(rows[i-1]["special_number"]))
-        curr_z = get_zodiac_by_number(int(rows[i]["special_number"]))
-        matrix[prev_z][curr_z] += 1.0
-        counts[prev_z] += 1
-    for z in ZODIAC_MAP:
-        if counts[z] > 0:
-            for z2 in ZODIAC_MAP:
-                matrix[z][z2] /= counts[z]
-    return matrix
-
-
-def build_main_to_special_matrix(rows: Sequence[sqlite3.Row], max_history: int = 200) -> Dict[str, Dict[str, float]]:
-    """上期主号生肖集合 → 本期特别号生肖的条件概率（累加）"""
-    matrix = {z: {z2: 0.0 for z2 in ZODIAC_MAP} for z in ZODIAC_MAP}
-    counts = {z: 0 for z in ZODIAC_MAP}
-    start = max(0, len(rows) - max_history)
-    for i in range(start, len(rows) - 1):
-        main_zodiacs = set(get_zodiac_by_number(n) for n in json.loads(rows[i]["numbers_json"]))
-        next_sp_z = get_zodiac_by_number(int(rows[i+1]["special_number"]))
-        for mz in main_zodiacs:
-            matrix[mz][next_sp_z] += 1.0
-            counts[mz] += 1
-    for z in ZODIAC_MAP:
-        if counts[z] > 0:
-            for z2 in ZODIAC_MAP:
-                matrix[z][z2] /= counts[z]
-    return matrix
-
-
-def get_zodiac_compatibility_score(target: str, existing: List[str]) -> float:
-    """计算目标生肖与已存在生肖的相容得分（越高越推荐）"""
-    score = 0.0
-    for e in existing:
-        pair = tuple(sorted([target, e]))
-        if pair in [tuple(sorted(p)) for p in ZODIAC_RELATIONS["六合"]]:
-            score += 2.0
-        for trio in ZODIAC_RELATIONS["三合"]:
-            if target in trio and e in trio:
-                score += 1.5
-                break
-        if pair in [tuple(sorted(p)) for p in ZODIAC_RELATIONS["六冲"]]:
-            score -= 3.0
-    return score
-
-
-def _build_zodiac_scores_from_rows(rows: Sequence[sqlite3.Row], decay: float = 0.18) -> Dict[str, float]:
-    """基础加权频率得分"""
-    scores = {z: 0.0 for z in ZODIAC_MAP}
-    for i, row in enumerate(rows):
-        w = 1.0 / (1.0 + i * decay)
-        nums = json.loads(row["numbers_json"])
-        sp = int(row["special_number"])
-        for n in nums:
-            scores[get_zodiac_by_number(n)] += w
-        scores[get_zodiac_by_number(sp)] += 1.15 * w
-    return scores
-
-
-# ---------- 核心增强预测函数 ----------
-def _compute_zodiac_feature_vector(
-    conn: sqlite3.Connection,
-    issue_no: str,
-    window: int,
-    rows: List[sqlite3.Row],
-    main_pool_zodiacs: List[str],
-) -> Dict[str, Dict[str, float]]:
-    """计算每个生肖在各特征维度上的原始得分（未加权）"""
-    features = {z: {f: 0.0 for f in _ZODIAC_FEATURE_WEIGHTS} for z in ZODIAC_MAP}
-
-    # 1. 频率特征
-    freq_scores = _build_zodiac_scores_from_rows(rows[-window:], decay=0.18)
-    max_freq = max(freq_scores.values()) if freq_scores else 1.0
-    for z in ZODIAC_MAP:
-        features[z]["freq"] = freq_scores[z] / max_freq
-
-    # 2. 遗漏特征
-    omission = build_zodiac_omission_map(rows, len(rows))
-    max_omit = max(omission.values()) if omission else 1
-    for z in ZODIAC_MAP:
-        features[z]["omission"] = omission[z] / max_omit
-
-    # 3. 转移概率特征（上期特别号生肖→本期）
-    if len(rows) >= 2:
-        prev_sp_z = get_zodiac_by_number(int(rows[-1]["special_number"]))
-        trans_mat = build_zodiac_transition_matrix(rows)
-        for z in ZODIAC_MAP:
-            features[z]["transition"] = trans_mat.get(prev_sp_z, {}).get(z, 0.0)
-
-    # 4. 周期特征
-    best_lag, acf = detect_zodiac_periodicity(rows)
-    if best_lag and abs(acf) > 0.25:
-        # 根据周期外推预测下一期生肖
-        special_seq = [get_zodiac_by_number(int(r["special_number"])) for r in rows]
-        predicted_z = special_seq[-best_lag] if best_lag < len(special_seq) else None
-        if predicted_z:
-            for z in ZODIAC_MAP:
-                features[z]["cycle"] = 1.0 if z == predicted_z else 0.0
-
-    # 5. 内部热度特征
-    internal_heat = get_zodiac_internal_heat(rows, window=20)
-    for z in ZODIAC_MAP:
-        features[z]["internal_heat"] = internal_heat[z]
-
-    # 6. 相容性特征（基于主号池已含生肖）
-    if main_pool_zodiacs:
-        for z in ZODIAC_MAP:
-            features[z]["compatibility"] = get_zodiac_compatibility_score(z, main_pool_zodiacs)
-        # 归一化到0~1
-        comp_vals = [features[z]["compatibility"] for z in ZODIAC_MAP]
-        min_c, max_c = min(comp_vals), max(comp_vals)
-        if max_c > min_c:
-            for z in ZODIAC_MAP:
-                features[z]["compatibility"] = (features[z]["compatibility"] - min_c) / (max_c - min_c)
-
-    # 7. 主号→特别号转移特征
-    if len(rows) >= 1:
-        last_main_zodiacs = set(get_zodiac_by_number(n) for n in json.loads(rows[-1]["numbers_json"]))
-        main_to_sp_mat = build_main_to_special_matrix(rows)
-        for z in ZODIAC_MAP:
-            prob_sum = sum(main_to_sp_mat.get(mz, {}).get(z, 0.0) for mz in last_main_zodiacs)
-            features[z]["main_to_special"] = prob_sum / len(last_main_zodiacs) if last_main_zodiacs else 0.0
-
-    return features
-
-
-def _predict_zodiac_scores_with_weights(features: Dict[str, Dict[str, float]]) -> Dict[str, float]:
-    """使用当前权重计算每个生肖的加权总分"""
-    scores = {}
-    for z in ZODIAC_MAP:
-        total = 0.0
-        for fname, weight in _ZODIAC_FEATURE_WEIGHTS.items():
-            total += weight * features[z].get(fname, 0.0)
-        scores[z] = total
-    return scores
-
-
-def _update_zodiac_weights(
-    features: Dict[str, Dict[str, float]],
-    actual_winning_zodiacs: Set[str],
-    learning_rate: float = _LEARNING_RATE,
-) -> None:
-    """根据实际开奖结果更新特征权重（在线梯度下降）"""
-    # 计算预测得分
-    pred_scores = _predict_zodiac_scores_with_weights(features)
-    sorted_pred = sorted(pred_scores.items(), key=lambda x: -x[1])
-
-    # 理想输出：排名第一的生肖如果命中则为1，否则为0（简化版，可扩展为top-k）
-    top_pred = sorted_pred[0][0]
-    target = 1.0 if top_pred in actual_winning_zodiacs else 0.0
-
-    # 当前预测概率（使用sigmoid将得分映射到0-1）
-    score_top = pred_scores[top_pred]
-    prob = 1.0 / (1.0 + math.exp(-score_top))  # sigmoid
-
-    # 误差梯度
-    error = target - prob
-
-    # 更新每个特征的权重
-    for fname in _ZODIAC_FEATURE_WEIGHTS:
-        grad = error * features[top_pred].get(fname, 0.0)
-        _ZODIAC_FEATURE_WEIGHTS[fname] += learning_rate * grad
-        # 保持权重为正且不过大
-        _ZODIAC_FEATURE_WEIGHTS[fname] = max(0.1, min(5.0, _ZODIAC_FEATURE_WEIGHTS[fname]))
-
-
-# ---------- 公开接口（完全兼容原函数签名） ----------
-def get_single_zodiac_pick(conn: sqlite3.Connection, issue_no: str, window: int = 18) -> str:
-    """增强版单生肖推荐，动态窗口+多特征融合+在线学习"""
-    rows = _draws_ordered_asc(conn)
-    if len(rows) < 6:
-        return "马"
-
-    # 动态窗口调整
-    recent_report = get_recent_single_zodiac_report(conn, lookback=8, history_window=18)
-    hit_rate = recent_report.get("hit_rate", 0.5)
-    miss_streak = int(recent_report.get("max_miss_streak", 0))
-    if hit_rate > 0.70:
-        window = 12
-    elif hit_rate < 0.40 or miss_streak >= 3:
-        window = 28
-    else:
-        window = 18
-
-    # 获取主号20码池生肖（用于相容性计算）
-    _, _, _, pool20, _ = _weighted_consensus_pools(conn, issue_no)
-    main_pool_zodiacs = [get_zodiac_by_number(n) for n in pool20] if pool20 else []
-
-    # 计算特征向量
-    features = _compute_zodiac_feature_vector(conn, issue_no, window, rows, main_pool_zodiacs)
-
-    # 加权得分
-    scores = _predict_zodiac_scores_with_weights(features)
-
-    # 额外加分：策略特别号投票
-    top_sp_votes = get_top_special_votes(conn, issue_no, top_n=5)
-    for sp in top_sp_votes:
-        scores[get_zodiac_by_number(sp)] += 1.2
-
-    # 最近特别号生肖轻微惩罚
-    if len(rows) >= 3:
-        recent_sp_z = [get_zodiac_by_number(int(r["special_number"])) for r in rows[-3:]]
-        for z in recent_sp_z:
-            scores[z] -= 0.3
-
-    # 保存特征用于事后学习（由外部在开奖后调用更新）
-    global _LAST_PREDICTION_FEATURES
-    _LAST_PREDICTION_FEATURES[issue_no] = features
-
-    ranked = sorted(scores.items(), key=lambda x: -x[1])
-    return ranked[0][0] if ranked else "马"
+def _build_zodiac_scores_from_rows(rows: Sequence[sqlite3.Row], decay: float = 0.20) -> Dict[str, float]:
+    zodiac_scores: Dict[str, float] = {z: 0.0 for z in ZODIAC_MAP.keys()}
+    for idx, row in enumerate(rows):
+        recency_w = 1.0 / (1.0 + idx * decay)
+        numbers = json.loads(row["numbers_json"])
+        for n in numbers:
+            zodiac_scores[get_zodiac_by_number(int(n))] += 1.0 * recency_w
+        zodiac_scores[get_zodiac_by_number(int(row["special_number"]))] += 1.15 * recency_w
+    return zodiac_scores
 
 
 def get_two_zodiac_picks(conn: sqlite3.Connection, issue_no: str, window: int = 18) -> List[str]:
-    """增强版双生肖推荐，基于单生肖评分扩展"""
-    rows = _draws_ordered_asc(conn)
-    if len(rows) < 6:
+    rows = conn.execute(
+        "SELECT numbers_json, special_number FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT ?",
+        (window,),
+    ).fetchall()
+    if not rows:
         return ["马", "蛇"]
 
-    recent_report = get_recent_two_zodiac_report(conn, lookback=8, history_window=18)
-    hit_rate = recent_report.get("hit_rate", 0.7)
-    miss_streak = int(recent_report.get("max_miss_streak", 0))
-    if hit_rate > 0.80:
-        window = 12
-    elif hit_rate < 0.60 or miss_streak >= 2:
-        window = 28
-    else:
-        window = 18
-
+    zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.20)
     _, _, _, pool20, _ = _weighted_consensus_pools(conn, issue_no)
-    main_pool_zodiacs = [get_zodiac_by_number(n) for n in pool20] if pool20 else []
-
-    features = _compute_zodiac_feature_vector(conn, issue_no, window, rows, main_pool_zodiacs)
-    scores = _predict_zodiac_scores_with_weights(features)
-
-    top_sp_votes = get_top_special_votes(conn, issue_no, top_n=5)
-    for sp in top_sp_votes:
-        scores[get_zodiac_by_number(sp)] += 1.0
-
-    if len(rows) >= 3:
-        recent_sp_z = [get_zodiac_by_number(int(r["special_number"])) for r in rows[-3:]]
-        for z in recent_sp_z:
-            scores[z] -= 0.25
-
-    _LAST_PREDICTION_FEATURES[issue_no] = features
-
-    ranked = sorted(scores.items(), key=lambda x: -x[1])
+    if pool20:
+        for idx, n in enumerate(pool20[:10]):
+            boost = 0.8 * (10 - idx) / 10.0
+            zodiac_scores[get_zodiac_by_number(int(n))] += boost
+    top_special_votes = get_top_special_votes(conn, issue_no, top_n=3)
+    if top_special_votes:
+        for sp in top_special_votes:
+            zodiac_scores[get_zodiac_by_number(sp)] += 1.2
+    recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:3]]
+    for z in recent_special_zodiacs:
+        zodiac_scores[z] -= 0.5
+    ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
     return [ranked[0][0], ranked[1][0]] if len(ranked) >= 2 else ["马", "蛇"]
 
 
-def update_zodiac_model_with_result(conn: sqlite3.Connection, issue_no: str) -> None:
-    """
-    在开奖后调用此函数，根据实际结果更新在线学习权重。
-    建议在 review_issue 或 review_latest 中自动调用。
-    """
-    global _LAST_PREDICTION_FEATURES
-    if issue_no not in _LAST_PREDICTION_FEATURES:
-        return
-    features = _LAST_PREDICTION_FEATURES[issue_no]
+def get_single_zodiac_pick(conn: sqlite3.Connection, issue_no: str, window: int = 18) -> str:
+    two_zodiac = get_two_zodiac_picks(conn, issue_no, window)
+    rows = conn.execute(
+        "SELECT numbers_json, special_number FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT ?",
+        (window,)
+    ).fetchall()
+    if not rows:
+        return two_zodiac[0] if two_zodiac else "马"
 
-    draw = conn.execute(
-        "SELECT numbers_json, special_number FROM draws WHERE issue_no = ?", (issue_no,)
-    ).fetchone()
-    if not draw:
-        return
-    win_main = json.loads(draw["numbers_json"])
-    win_sp = int(draw["special_number"])
-    winning_zodiacs = set(get_zodiac_by_number(n) for n in win_main)
-    winning_zodiacs.add(get_zodiac_by_number(win_sp))
+    zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.20)
+    recent_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:12]]
+    zodiac_counter = Counter(recent_zodiacs)
+    if zodiac_counter:
+        coldest = min(zodiac_counter.keys(), key=lambda z: zodiac_counter[z])
+        zodiac_scores[coldest] += 2.0
+    _, _, _, pool20, _ = _weighted_consensus_pools(conn, issue_no)
+    if pool20:
+        pool_zodiacs = [get_zodiac_by_number(n) for n in pool20]
+        for z, cnt in Counter(pool_zodiacs).items():
+            zodiac_scores[z] += cnt * 0.4
+    top_special_votes = get_top_special_votes(conn, issue_no, top_n=3)
+    if top_special_votes:
+        for sp in top_special_votes:
+            zodiac_scores[get_zodiac_by_number(sp)] += 1.5
+    recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:3]]
+    for z in recent_special_zodiacs:
+        zodiac_scores[z] -= 0.8
+    for z in two_zodiac:
+        zodiac_scores[z] += 3.0
+    ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
+    for candidate, _ in ranked:
+        if candidate in two_zodiac:
+            return candidate
+    return ranked[0][0]
 
-    _update_zodiac_weights(features, winning_zodiacs)
-    # 清理已使用的特征
-    del _LAST_PREDICTION_FEATURES[issue_no]
+
+def get_hot_cold_zodiacs(conn: sqlite3.Connection, window: int = 12, top_n: int = 3) -> Tuple[List[str], List[str]]:
+    rows = conn.execute(
+        "SELECT numbers_json, special_number FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT ?",
+        (window,)
+    ).fetchall()
+    if len(rows) < window:
+        default = ["马", "蛇", "龙", "兔", "虎", "牛"]
+        return default[:top_n], default[-top_n:]
+    score_counter: Dict[str, float] = {z: 0.0 for z in ZODIAC_MAP.keys()}
+    for idx, row in enumerate(rows):
+        recency_w = 1.0 / (1.0 + idx * 0.35)
+        numbers = json.loads(row["numbers_json"])
+        for n in numbers:
+            score_counter[get_zodiac_by_number(n)] += 1.0 * recency_w
+        special = row["special_number"]
+        score_counter[get_zodiac_by_number(special)] += 1.2 * recency_w
+    sorted_by_freq = sorted(score_counter.items(), key=lambda x: x[1], reverse=True)
+    hot = [z for z, _ in sorted_by_freq[:top_n]]
+    all_zodiacs = list(ZODIAC_MAP.keys())
+    cold_candidates = [(z, score_counter.get(z, 0.0)) for z in all_zodiacs]
+    cold_candidates.sort(key=lambda x: x[1])
+    cold = [z for z, _ in cold_candidates[:top_n]]
+    return hot, cold
 
 
-# ---------- 复盘的增强版（覆盖原函数） ----------
+def _get_two_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> List[str]:
+    if not rows:
+        return ["马", "蛇"]
+    zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.20)
+    recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:3]]
+    for z in recent_special_zodiacs:
+        zodiac_scores[z] -= 0.5
+    ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
+    return [ranked[0][0], ranked[1][0]] if len(ranked) >= 2 else ["马", "蛇"]
+
+
+def _get_single_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> str:
+    two_zodiac = _get_two_zodiac_from_history_rows(rows)
+    if not rows:
+        return two_zodiac[0] if two_zodiac else "马"
+    zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.20)
+    recent_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:12]]
+    zodiac_counter = Counter(recent_zodiacs)
+    if zodiac_counter:
+        coldest = min(zodiac_counter.keys(), key=lambda z: zodiac_counter[z])
+        zodiac_scores[coldest] += 2.0
+    recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:3]]
+    for z in recent_special_zodiacs:
+        zodiac_scores[z] -= 0.8
+    for z in two_zodiac:
+        zodiac_scores[z] += 3.0
+    ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
+    for candidate, _ in ranked:
+        if candidate in two_zodiac:
+            return candidate
+    return ranked[0][0] if ranked else "马"
+
+
 def get_recent_single_zodiac_report(
-    conn: sqlite3.Connection, lookback: int = 20, history_window: int = 18
+    conn: sqlite3.Connection,
+    lookback: int = 20,
+    history_window: int = 18,
 ) -> Dict[str, float]:
-    """单生肖回测报告（使用增强版预测）"""
     rows = _draws_ordered_asc(conn)
     if len(rows) < history_window + 1:
         return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
+
     start = max(history_window, len(rows) - lookback)
-    hits, samples, miss, max_miss = 0, 0, 0, 0
+    hits = 0
+    samples = 0
+    miss_streak = 0
+    max_miss_streak = 0
     for i in range(start, len(rows)):
-        hist = rows[max(0, i - history_window):i]
-        if len(hist) < history_window:
+        history_rows = rows[max(0, i - history_window):i]
+        if len(history_rows) < history_window:
             continue
-        issue_no = rows[i]["issue_no"]
-        # 临时构造一个模拟预测（不使用在线学习，仅特征计算）
-        _, _, _, pool20, _ = _weighted_consensus_pools(conn, issue_no)
-        main_pool_zodiacs = [get_zodiac_by_number(n) for n in pool20] if pool20 else []
-        features = _compute_zodiac_feature_vector(conn, issue_no, history_window, hist, main_pool_zodiacs)
-        scores = _predict_zodiac_scores_with_weights(features)
-        pred = max(scores, key=scores.get)
+        pick = _get_single_zodiac_from_history_rows(history_rows)
         win_main = json.loads(rows[i]["numbers_json"])
-        win_sp = int(rows[i]["special_number"])
-        win_zodiacs = set(get_zodiac_by_number(n) for n in win_main)
-        win_zodiacs.add(get_zodiac_by_number(win_sp))
-        hit = 1 if pred in win_zodiacs else 0
+        win_special = int(rows[i]["special_number"])
+        winning_zodiacs = {get_zodiac_by_number(int(n)) for n in win_main}
+        winning_zodiacs.add(get_zodiac_by_number(win_special))
+        hit = 1 if pick in winning_zodiacs else 0
         hits += hit
         samples += 1
         if hit == 0:
-            miss += 1
-            max_miss = max(max_miss, miss)
+            miss_streak += 1
+            max_miss_streak = max(max_miss_streak, miss_streak)
         else:
-            miss = 0
+            miss_streak = 0
+
     if samples == 0:
         return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
-    return {"samples": float(samples), "hit_rate": hits / samples, "max_miss_streak": float(max_miss)}
+    return {
+        "samples": float(samples),
+        "hit_rate": float(hits / samples),
+        "max_miss_streak": float(max_miss_streak),
+    }
 
 
 def get_recent_two_zodiac_report(
-    conn: sqlite3.Connection, lookback: int = 20, history_window: int = 18
+    conn: sqlite3.Connection,
+    lookback: int = 20,
+    history_window: int = 18,
 ) -> Dict[str, float]:
-    """双生肖回测报告"""
     rows = _draws_ordered_asc(conn)
     if len(rows) < history_window + 1:
         return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
+
     start = max(history_window, len(rows) - lookback)
-    hits, samples, miss, max_miss = 0, 0, 0, 0
+    hits = 0
+    samples = 0
+    miss_streak = 0
+    max_miss_streak = 0
     for i in range(start, len(rows)):
-        hist = rows[max(0, i - history_window):i]
-        if len(hist) < history_window:
+        history_rows = rows[max(0, i - history_window):i]
+        if len(history_rows) < history_window:
             continue
-        issue_no = rows[i]["issue_no"]
-        _, _, _, pool20, _ = _weighted_consensus_pools(conn, issue_no)
-        main_pool_zodiacs = [get_zodiac_by_number(n) for n in pool20] if pool20 else []
-        features = _compute_zodiac_feature_vector(conn, issue_no, history_window, hist, main_pool_zodiacs)
-        scores = _predict_zodiac_scores_with_weights(features)
-        ranked = sorted(scores.items(), key=lambda x: -x[1])
-        preds = [ranked[0][0], ranked[1][0]] if len(ranked) >= 2 else ["马", "蛇"]
+        picks = _get_two_zodiac_from_history_rows(history_rows)
         win_main = json.loads(rows[i]["numbers_json"])
-        win_sp = int(rows[i]["special_number"])
-        win_zodiacs = set(get_zodiac_by_number(n) for n in win_main)
-        win_zodiacs.add(get_zodiac_by_number(win_sp))
-        hit = 1 if any(p in win_zodiacs for p in preds) else 0
+        win_special = int(rows[i]["special_number"])
+        winning_zodiacs = {get_zodiac_by_number(int(n)) for n in win_main}
+        winning_zodiacs.add(get_zodiac_by_number(win_special))
+        hit = 1 if any(z in winning_zodiacs for z in picks) else 0
         hits += hit
         samples += 1
         if hit == 0:
-            miss += 1
-            max_miss = max(max_miss, miss)
+            miss_streak += 1
+            max_miss_streak = max(max_miss_streak, miss_streak)
         else:
-            miss = 0
+            miss_streak = 0
+
     if samples == 0:
         return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
-    return {"samples": float(samples), "hit_rate": hits / samples, "max_miss_streak": float(max_miss)}
-
-
-# 保留原函数别名以兼容（若原有其他调用）
-get_hot_cold_zodiacs = lambda conn, window=12, top_n=3: (["马", "蛇", "龙"], ["兔", "虎", "牛"])  # 简化占位
+    return {
+        "samples": float(samples),
+        "hit_rate": float(hits / samples),
+        "max_miss_streak": float(max_miss_streak),
+    }
 
 
 # ========== 特别号投票 ==========
