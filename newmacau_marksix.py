@@ -2035,10 +2035,11 @@ def get_two_zodiac_picks(conn: sqlite3.Connection, issue_no: str, window: int = 
             recent_all_zodiacs.add(get_zodiac_by_number(int(r["special_number"])))
         cold_candidates = [z for z in ZODIAC_MAP.keys() if z not in recent_all_zodiacs]
         if cold_candidates:
+            # 将得分最低的生肖替换为最冷生肖
             ranked = sorted(zodiac_scores.items(), key=lambda x: x[1])
             lowest = ranked[0][0]
-            zodiac_scores[lowest] *= 0.1     # ↓ 从0.3大幅降至0.1（彻底压制原最低分）
-            zodiac_scores[cold_candidates[0]] += 4.5   # ↑ 从3.0提升至4.5（强制出线）
+            zodiac_scores[lowest] *= 0.1
+            zodiac_scores[cold_candidates[0]] += 4.5
             
     ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
     return [ranked[0][0], ranked[1][0]] if len(ranked) >= 2 else ["马", "蛇"]
@@ -2057,7 +2058,7 @@ def get_single_zodiac_pick(conn: sqlite3.Connection, issue_no: str, window: int 
     zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.20)
     
     # 连挂增强：增加冷生肖补偿系数，并大幅提升遗漏值权重
-        if single_streak >= 2:
+    if single_streak >= 2:
         recent_zodiacs_all = []
         for r in rows[:single_streak+2]:
             recent_zodiacs_all.extend([get_zodiac_by_number(int(n)) for n in json.loads(r["numbers_json"])])
@@ -2065,9 +2066,9 @@ def get_single_zodiac_pick(conn: sqlite3.Connection, issue_no: str, window: int 
         recent_zodiac_set = set(recent_zodiacs_all)
         for z in zodiac_scores:
             if z not in recent_zodiac_set:
-                zodiac_scores[z] *= 2.2   # ↑ 从1.8提升至2.2
+                zodiac_scores[z] *= 2.2
             else:
-                zodiac_scores[z] *= 0.5   # ↓ 从0.7降至0.5（更强压制）
+                zodiac_scores[z] *= 0.5
                 
     recent_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:12]]
     zodiac_counter = Counter(recent_zodiacs)
