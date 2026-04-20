@@ -2244,7 +2244,7 @@ def _get_two_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> List[str]:
 
     return picks[:2] if len(picks) >= 2 else ["马", "蛇"]
 
-ddef _get_two_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> List[str]:
+def _get_two_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> List[str]:
     if not rows:
         return ["马", "蛇"]
 
