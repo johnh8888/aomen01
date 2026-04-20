@@ -2354,7 +2354,7 @@ def _get_single_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> str:
     for candidate, _ in ranked:
         if candidate in two_zodiac:
             return candidate
-    return ranked[0][0]"
+    return ranked[0][0]
 
 
 def get_recent_single_zodiac_report(
