@@ -1216,12 +1216,17 @@ def _ensemble_strategy_v3_1(
     sub_strategies = ["hot_v1", "cold_rebound_v1", "momentum_v1", "balanced_v1", "pattern_mined_v1"]
     score_maps = []
     sub_picks = {}
+    
+    # 偏态检测
     bias_score, _ = detect_bias(conn, window=10)
     adjusted_weights = adjust_weights_for_bias(strategy_weights, bias_score)
+    
     if bias_score > BIAS_THRESHOLD:
-    print(f"[集成策略] 🔥 偏态模式激活，偏态系数={bias_score:.2f} 🔥", flush=True)
-    if bias_score >= 0.73:
-        print("   → 当前处于强偏态状态，冷号回补权重已显著提升！", flush=True)
+        print(f"[集成策略] 🔥 偏态模式激活，偏态系数={bias_score:.2f} 🔥", flush=True)
+        if bias_score >= 0.73:
+            print("   → 当前处于强偏态状态，冷号回补权重已显著提升！", flush=True)
+    else:
+        print(f"[集成策略] 正常模式，偏态系数={bias_score:.2f}", flush=True)
 
     for sub in sub_strategies:
         win_size = get_adaptive_strategy_window(sub, conn)
