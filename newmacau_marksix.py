@@ -2012,7 +2012,7 @@ def get_two_zodiac_picks(conn: sqlite3.Connection, issue_no: str, window: int = 
     zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.08)
     omission_map = _zodiac_omission_map(rows)
 
-    # 遗漏保护：阈值降低至8期，强制入选
+    # 遗漏保护：阈值8期
     force_include = []
     for z, omit in omission_map.items():
         if omit >= 8:
@@ -2031,49 +2031,32 @@ def get_two_zodiac_picks(conn: sqlite3.Connection, issue_no: str, window: int = 
         for sp in top_special_votes:
             zodiac_scores[get_zodiac_by_number(sp)] += 1.5
 
-    # 上期是否命中检测
+    # ---------- 上期未命中补偿 ----------
     prev_issue = _get_previous_issue(conn, issue_no)
     prev_hit = False
-    prev_prev_hit = False
     if prev_issue:
         prev_hit = _check_two_zodiac_hit(conn, prev_issue)
-        # 检测上上期是否命中（用于连续未中保护）
-        prev_prev_issue = _get_previous_issue(conn, prev_issue)
-        if prev_prev_issue:
-            prev_prev_hit = _check_two_zodiac_hit(conn, prev_prev_issue)
 
-    # ---------- 强力兜底规则 ----------
-    # 规则1：如果上期未中，直接返回上期开奖中最热的两个生肖（100%命中率保证）
+    # ===== 绝对兜底：上期未命中则直接返回上期最热两个生肖 =====
     if not prev_hit and prev_issue:
         prev_draw = conn.execute(
             "SELECT numbers_json, special_number FROM draws WHERE issue_no = ?",
             (prev_issue,)
         ).fetchone()
         if prev_draw:
-            prev_zodiacs = [get_zodiac_by_number(n) for n in json.loads(prev_draw["numbers_json"])]
+            prev_zodiacs = []
+            for n in json.loads(prev_draw["numbers_json"]):
+                prev_zodiacs.append(get_zodiac_by_number(n))
             prev_zodiacs.append(get_zodiac_by_number(prev_draw["special_number"]))
-            # 出现频率最高的两个生肖
             hot_two = [z for z, _ in Counter(prev_zodiacs).most_common(2)]
             if len(hot_two) >= 2:
+                # 调试输出（回测时可见）
+                # print(f"[双生肖强制补偿] 期号{issue_no} 上期{prev_issue}未中，直接返回{hot_two}")
                 return hot_two[:2]
 
-    # 规则2：如果连续两期未中，强制锁定最近一期特别号生肖 + 上期最热主号生肖
-    if not prev_hit and not prev_prev_hit:
-        recent_special_zodiac = get_zodiac_by_number(int(rows[0]["special_number"]))
-        if prev_issue:
-            prev_draw = conn.execute(
-                "SELECT numbers_json FROM draws WHERE issue_no = ?",
-                (prev_issue,)
-            ).fetchone()
-            if prev_draw:
-                prev_main_zodiacs = [get_zodiac_by_number(n) for n in json.loads(prev_draw["numbers_json"])]
-                hot_main = Counter(prev_main_zodiacs).most_common(1)[0][0]
-                return [recent_special_zodiac, hot_main]
-
-    # 正常流程：生成得分排序的 picks
+    # 正常流程
     ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
     picks = []
-    # 先加入强制遗漏保护生肖
     for z in force_include:
         if z not in picks:
             picks.append(z)
@@ -2083,25 +2066,15 @@ def get_two_zodiac_picks(conn: sqlite3.Connection, issue_no: str, window: int = 
         if z not in picks:
             picks.append(z)
 
-    # 若上期未中但未被规则1捕获（兜底），再额外提升上期热号得分
-    if not prev_hit and prev_issue:
-        prev_draw = conn.execute(
-            "SELECT numbers_json, special_number FROM draws WHERE issue_no = ?",
-            (prev_issue,)
-        ).fetchone()
-        if prev_draw:
-            prev_zodiacs = [get_zodiac_by_number(n) for n in json.loads(prev_draw["numbers_json"])]
-            prev_zodiacs.append(get_zodiac_by_number(prev_draw["special_number"]))
-            hot_prev = Counter(prev_zodiacs).most_common(2)
-            for z, _ in hot_prev:
-                # 强行插入到 picks 中（替换掉得分低的）
-                if z not in picks and len(picks) == 2:
-                    picks[-1] = z
-                elif z not in picks:
-                    picks.append(z)
+    # 兜底：如果仍未满两个，用最高分补齐
+    if len(picks) < 2:
+        for z, _ in ranked:
+            if z not in picks:
+                picks.append(z)
+                if len(picks) == 2:
+                    break
 
-    return picks[:2] if len(picks) >= 2 else ["马", "蛇"]
-
+    return picks[:2]
 def get_single_zodiac_pick(conn: sqlite3.Connection, issue_no: str, window: int = 14) -> str:
     two_zodiac = get_two_zodiac_picks(conn, issue_no, window)
     rows = conn.execute(
