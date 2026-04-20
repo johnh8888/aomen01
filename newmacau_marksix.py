@@ -1962,7 +1962,50 @@ def _build_zodiac_scores_from_rows(rows: Sequence[sqlite3.Row], decay: float = 0
     return zodiac_scores
 
 
+# ===== 新增：生肖连挂状态检测 =====
+def get_zodiac_streak_info(conn: sqlite3.Connection) -> Tuple[int, int, List[str]]:
+    """
+    返回 (单生肖连挂期数, 双生肖连挂期数, 最近一次推荐的单生肖列表[用于回看])
+    """
+    rows = _draws_ordered_asc(conn)
+    if len(rows) < 20:
+        return 0, 0, ["马"]
+    
+    single_streak = 0
+    double_streak = 0
+    last_single_pick = "马"
+    for i in range(len(rows)-1, max(0, len(rows)-40), -1):
+        history_rows = rows[max(0, i-18):i]
+        if len(history_rows) < 18:
+            continue
+        win_main = set(json.loads(rows[i]["numbers_json"]))
+        win_special = int(rows[i]["special_number"])
+        winning_zodiacs = {get_zodiac_by_number(int(n)) for n in win_main}
+        winning_zodiacs.add(get_zodiac_by_number(win_special))
+        
+        single_pick = _get_single_zodiac_from_history_rows(history_rows)
+        double_picks = _get_two_zodiac_from_history_rows(history_rows)
+        
+        if single_streak == 0 and double_streak == 0:
+            last_single_pick = single_pick
+        
+        if single_pick in winning_zodiacs:
+            if single_streak > 0:
+                break
+        else:
+            single_streak += 1
+            
+        if any(z in winning_zodiacs for z in double_picks):
+            if double_streak > 0:
+                break
+        else:
+            double_streak += 1
+            
+    return single_streak, double_streak, [last_single_pick]
+
+
 def get_two_zodiac_picks(conn: sqlite3.Connection, issue_no: str, window: int = 18) -> List[str]:
+    _, double_streak, _ = get_zodiac_streak_info(conn)
     rows = conn.execute(
         "SELECT numbers_json, special_number FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT ?",
         (window,),
@@ -1983,11 +2026,27 @@ def get_two_zodiac_picks(conn: sqlite3.Connection, issue_no: str, window: int = 
     recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:3]]
     for z in recent_special_zodiacs:
         zodiac_scores[z] -= 0.5
+        
+    # 连挂强制冷生肖替换
+    if double_streak >= 1:
+        recent_all_zodiacs = set()
+        for r in rows[:double_streak+2]:
+            recent_all_zodiacs.update([get_zodiac_by_number(int(n)) for n in json.loads(r["numbers_json"])])
+            recent_all_zodiacs.add(get_zodiac_by_number(int(r["special_number"])))
+        cold_candidates = [z for z in ZODIAC_MAP.keys() if z not in recent_all_zodiacs]
+        if cold_candidates:
+            # 将得分最低的生肖替换为最冷生肖
+            ranked = sorted(zodiac_scores.items(), key=lambda x: x[1])
+            lowest = ranked[0][0]
+            zodiac_scores[lowest] *= 0.3
+            zodiac_scores[cold_candidates[0]] += 3.0  # 强制提升
+            
     ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
     return [ranked[0][0], ranked[1][0]] if len(ranked) >= 2 else ["马", "蛇"]
 
 
 def get_single_zodiac_pick(conn: sqlite3.Connection, issue_no: str, window: int = 18) -> str:
+    single_streak, _, _ = get_zodiac_streak_info(conn)
     two_zodiac = get_two_zodiac_picks(conn, issue_no, window)
     rows = conn.execute(
         "SELECT numbers_json, special_number FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT ?",
@@ -1997,25 +2056,44 @@ def get_single_zodiac_pick(conn: sqlite3.Connection, issue_no: str, window: int 
         return two_zodiac[0] if two_zodiac else "马"
 
     zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.20)
+    
+    # 连挂增强：增加冷生肖补偿系数，并大幅提升遗漏值权重
+    if single_streak >= 2:
+        recent_zodiacs_all = []
+        for r in rows[:single_streak+2]:
+            recent_zodiacs_all.extend([get_zodiac_by_number(int(n)) for n in json.loads(r["numbers_json"])])
+            recent_zodiacs_all.append(get_zodiac_by_number(int(r["special_number"])))
+        recent_zodiac_set = set(recent_zodiacs_all)
+        for z in zodiac_scores:
+            if z not in recent_zodiac_set:
+                zodiac_scores[z] *= 1.8  # 完全未出现生肖权重飙升
+            else:
+                zodiac_scores[z] *= 0.7  # 已出现生肖压制
+                
     recent_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:12]]
     zodiac_counter = Counter(recent_zodiacs)
     if zodiac_counter:
         coldest = min(zodiac_counter.keys(), key=lambda z: zodiac_counter[z])
-        zodiac_scores[coldest] += 2.0
+        zodiac_scores[coldest] += (2.5 if single_streak >= 2 else 2.0)
+    
     _, _, _, pool20, _ = _weighted_consensus_pools(conn, issue_no)
     if pool20:
         pool_zodiacs = [get_zodiac_by_number(n) for n in pool20]
         for z, cnt in Counter(pool_zodiacs).items():
-            zodiac_scores[z] += cnt * 0.4
+            zodiac_scores[z] += cnt * (0.6 if single_streak >= 2 else 0.4)
+    
     top_special_votes = get_top_special_votes(conn, issue_no, top_n=3)
     if top_special_votes:
         for sp in top_special_votes:
-            zodiac_scores[get_zodiac_by_number(sp)] += 1.5
+            zodiac_scores[get_zodiac_by_number(sp)] += 1.8
+    
     recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:3]]
     for z in recent_special_zodiacs:
-        zodiac_scores[z] -= 0.8
+        zodiac_scores[z] -= 0.9
+    
     for z in two_zodiac:
-        zodiac_scores[z] += 3.0
+        zodiac_scores[z] += 3.5
+    
     ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
     for candidate, _ in ranked:
         if candidate in two_zodiac:
@@ -2048,6 +2126,7 @@ def get_hot_cold_zodiacs(conn: sqlite3.Connection, window: int = 12, top_n: int 
     return hot, cold
 
 
+# ===== 回测专用内部函数（同步优化）=====
 def _get_two_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> List[str]:
     if not rows:
         return ["马", "蛇"]
@@ -2055,6 +2134,7 @@ def _get_two_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> List[str]:
     recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:3]]
     for z in recent_special_zodiacs:
         zodiac_scores[z] -= 0.5
+    # 简单模拟连挂检测：由于没有conn，此处仅做基本排序
     ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
     return [ranked[0][0], ranked[1][0]] if len(ranked) >= 2 else ["马", "蛇"]
 
