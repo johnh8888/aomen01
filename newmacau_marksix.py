@@ -32,7 +32,7 @@ API_RETRY_BACKOFF_SECONDS = 2.0
 MINED_CONFIG_KEY = "mined_strategy_config_v1"
 ALL_NUMBERS = list(range(1, 50))
 
-# ==================== 【优化后常量 - 请替换】 ====================
+# ==================== 【优化后常量】 ====================
 FEATURE_WINDOW_DEFAULT = 10
 
 STRATEGY_BASE_WINDOWS = {
@@ -40,7 +40,7 @@ STRATEGY_BASE_WINDOWS = {
     "momentum_v1": 7,
     "cold_rebound_v1": 13,
     "balanced_v1": 10,
-    "pattern_mined_v1": 10,
+    "pattern_mined_v1": 6,   # 日志最佳窗口改为6
     "ensemble_v2": 10,
 }
 
@@ -50,6 +50,10 @@ BACKTEST_ISSUES_DEFAULT = 120
 
 # Ensemble v3.1 配置
 ENSEMBLE_DIVERSITY_BONUS = 0.13
+
+# 偏态检测阈值
+BIAS_THRESHOLD = 0.65
+BIAS_ADJUSTMENT = 0.45
 
 STRATEGY_LABELS = {
     "balanced_v1": "组合策略",
@@ -371,14 +375,6 @@ def parse_draw_csv_text(csv_text: str) -> List[DrawRecord]:
     for r in records:
         dedup[r.issue_no] = r
     return sorted(dedup.values(), key=lambda r: (r.draw_date, r.issue_no))
-
-
-def _to_int(value: object) -> Optional[int]:
-    try:
-        n = int(str(value).strip())
-    except (ValueError, TypeError):
-        return None
-    return n if 1 <= n <= 49 else None
 
 
 def parse_macau_from_marksix6_api(payload: dict) -> List[DrawRecord]:
@@ -737,12 +733,12 @@ def _pick_top_six(scores: Dict[int, float], reason: str) -> List[Tuple[int, int,
 
 def _default_mined_config() -> Dict[str, float]:
     return {
-        "window": float(FEATURE_WINDOW_DEFAULT),
-        "w_freq": 0.40,
-        "w_omit": 0.30,
+        "window": 6.0,
+        "w_freq": 0.30,
+        "w_omit": 0.50,
         "w_mom": 0.20,
-        "w_pair": 0.05,
-        "w_zone": 0.05,
+        "w_pair": 0.00,
+        "w_zone": 0.10,
         "special_bonus": 0.10,
     }
 
@@ -962,13 +958,62 @@ def get_adaptive_strategy_window(strategy: str, conn: sqlite3.Connection) -> int
     return base
 
 
-def _generate_special_number_v2(
+# ========== 偏态检测函数 ==========
+def detect_bias(conn: sqlite3.Connection, window: int = 10) -> Tuple[float, Dict[str, float]]:
+    rows = conn.execute(
+        "SELECT numbers_json FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT ?",
+        (window,)
+    ).fetchall()
+    if len(rows) < 5:
+        return 0.0, {}
+    all_nums = []
+    for row in rows:
+        all_nums.extend(json.loads(row["numbers_json"]))
+    zone_dist = [0] * 5
+    for n in all_nums:
+        zone_dist[min(4, (n - 1) // 10)] += 1
+    expected = len(all_nums) / 5
+    zone_variance = sum((d - expected) ** 2 for d in zone_dist) / 5
+    zone_bias = min(1.0, zone_variance / 15)
+    odd_count = sum(1 for n in all_nums if n % 2 == 1)
+    odd_ratio = odd_count / len(all_nums)
+    parity_bias = abs(odd_ratio - 0.5) * 2
+    freq = Counter(all_nums)
+    hot_count = sum(1 for f in freq.values() if f >= 3)
+    cold_count = sum(1 for f in freq.values() if f == 0)
+    hot_cold_ratio = hot_count / (cold_count + 1) if cold_count > 0 else hot_count
+    hot_cold_bias = min(1.0, abs(hot_cold_ratio - 1) / 2)
+    bias_score = (zone_bias * 0.4 + parity_bias * 0.3 + hot_cold_bias * 0.3)
+    return bias_score, {
+        "zone_bias": zone_bias,
+        "parity_bias": parity_bias,
+        "hot_cold_bias": hot_cold_bias,
+        "zone_dist": zone_dist,
+        "odd_ratio": odd_ratio
+    }
+
+
+def adjust_weights_for_bias(weights: Dict[str, float], bias_score: float) -> Dict[str, float]:
+    if bias_score < BIAS_THRESHOLD:
+        return weights
+    adjusted = weights.copy()
+    cold_boost = 1 + BIAS_ADJUSTMENT * bias_score
+    adjusted["cold_rebound_v1"] = weights.get("cold_rebound_v1", 0.15) * cold_boost
+    adjusted["hot_v1"] = weights.get("hot_v1", 0.15) * (1 - BIAS_ADJUSTMENT * bias_score * 0.7)
+    adjusted["momentum_v1"] = weights.get("momentum_v1", 0.15) * (1 - BIAS_ADJUSTMENT * bias_score * 0.5)
+    total = sum(adjusted.values())
+    if total > 0:
+        adjusted = {k: v / total for k, v in adjusted.items()}
+    return adjusted
+
+
+# ========== 特别号 v4 增强版 ==========
+def _generate_special_number_v4(
     conn: sqlite3.Connection,
     main_pool: List[int],
     issue_no: str
 ) -> Tuple[int, float, List[int]]:
-    """特别号独立模型 v3 - 增强版：增加生肖周期 + 主号关联 + 冷热切换"""
-    
+    """特别号独立模型 v4 - 增强版：增加生肖周期 + 主号关联 + 冷热切换"""
     # 1. 获取各策略的特别号投票
     special_votes = []
     for strategy in STRATEGY_IDS:
@@ -981,127 +1026,168 @@ def _generate_special_number_v2(
             if sp is not None:
                 special_votes.append(sp)
     vote_counter = Counter(special_votes)
-    
+
     # 2. 获取历史特别号（最近60期）
     recent_specials = [int(r["special_number"]) for r in conn.execute(
         "SELECT special_number FROM draws ORDER BY draw_date DESC LIMIT 60"
     ).fetchall()]
-    
+
     # 3. 计算遗漏值
     omission = {n: 60 for n in ALL_NUMBERS}
     for i, num in enumerate(recent_specials):
         omission[num] = min(omission.get(num, 60), i + 1)
-    
-    # 4. 生肖周期分析（每12期一个循环）
-    zodiac_cycle = []
-    for sp in recent_specials[:24]:  # 最近24期
-        zodiac_cycle.append(get_zodiac_by_number(sp))
-    
-    # 预测下一个生肖（取最近3期的趋势）
+
+    # 4. 生肖周期分析
+    zodiac_cycle = [get_zodiac_by_number(sp) for sp in recent_specials[:24]]
     if len(zodiac_cycle) >= 6:
         recent_zodiacs = zodiac_cycle[:6]
-        # 找出现次数最少的生肖（轮转逻辑）
         zodiac_counter = Counter(recent_zodiacs)
         least_zodiac = min(zodiac_counter.keys(), key=lambda z: zodiac_counter[z])
         predicted_zodiac_numbers = ZODIAC_MAP.get(least_zodiac, [1, 13, 25, 37, 49])
     else:
         predicted_zodiac_numbers = ALL_NUMBERS
-    
-    # 5. 主号关联模式分析
-    # 统计特别号与主号的关系（差值、倍数、尾数等）
-    main_relations = []
-    rows = conn.execute(
-        "SELECT numbers_json, special_number FROM draws ORDER BY draw_date DESC LIMIT 30"
-    ).fetchall()
-    
-    for row in rows:
-        main_nums = json.loads(row["numbers_json"])
-        special = int(row["special_number"])
-        for mn in main_nums:
-            diff = abs(special - mn)
-            if 1 <= diff <= 5:  # 特别号与主号相差1-5
-                main_relations.append(("near", diff))
-            elif special % 10 == mn % 10:  # 同尾数
-                main_relations.append(("same_tail", mn % 10))
-            elif special == mn + 1 or special == mn - 1:  # 相邻
-                main_relations.append(("adjacent", mn))
-    
-    # 6. 计算综合得分
+
+    tail_counter = Counter([n % 10 for n in recent_specials[:20]])
+    coldest_tail = min(tail_counter.keys(), key=lambda t: tail_counter[t]) if tail_counter else 0
+
+    main_zones_set = {(m - 1) // 10 for m in main_pool}
+
+    # 5. 计算综合得分
     main_set = set(main_pool)
     scores = {}
-    
+
     for n in ALL_NUMBERS:
         if n in main_set:
             continue
-        
+
         score = 0.0
-        
-        # 6.1 投票得分（权重最高）
-        score += vote_counter.get(n, 0) * 4.0
-        
-        # 6.2 遗漏得分（越冷越高，但要防止过度追冷）
+        # 投票得分
+        score += vote_counter.get(n, 0) * 6.0
+        # 遗漏得分
         omission_score = (60 - omission.get(n, 60)) / 60.0
-        # 冷号阈值：遗漏超过15期开始加分
-        if omission.get(n, 60) > 15:
-            score += omission_score * 2.5
+        if omission.get(n, 60) > 12:
+            score += omission_score * 4.0
         else:
             score += omission_score * 1.0
-        
-        # 6.3 热号衰减（最近5期出过的特别号降权）
-        if n in recent_specials[:5]:
+        # 热号衰减
+        if n in recent_specials[:2]:
+            score *= 0.2
+        elif n in recent_specials[2:5]:
             score *= 0.6
-        
-        # 6.4 生肖周期加分
+        # 生肖周期加分
         if n in predicted_zodiac_numbers:
-            score += 1.5
-        
-        # 6.5 与主号的关联加分（主号±1~3）
+            score += 1.8
+        if n % 10 == coldest_tail:
+            score += 1.2
+        # 与主号的关联加分
         for mn in main_pool:
             diff = abs(n - mn)
             if diff == 1:
-                score += 1.2
+                score += 2.0
             elif diff == 2:
-                score += 0.8
+                score += 1.5
             elif diff == 3:
-                score += 0.5
-            elif n % 10 == mn % 10 and n != mn:  # 同尾数
-                score += 0.6
-        
-        # 6.6 奇偶平衡（最近5期特别号奇偶统计）
+                score += 1.0
+            elif n % 10 == mn % 10 and n != mn:
+                score += 0.8
+        n_zone = (n - 1) // 10
+        if n_zone in main_zones_set:
+            score += 1.2
+        # 奇偶平衡
         recent_parity = [sp % 2 for sp in recent_specials[:5]]
         if len(recent_parity) >= 3:
             odd_ratio = sum(recent_parity) / len(recent_parity)
-            if odd_ratio > 0.6 and n % 2 == 0:  # 最近偏奇，推荐偶
-                score += 0.8
-            elif odd_ratio < 0.4 and n % 2 == 1:  # 最近偏偶，推荐奇
-                score += 0.8
-        
+            if odd_ratio > 0.6 and n % 2 == 0:
+                score += 1.0
+            elif odd_ratio < 0.4 and n % 2 == 1:
+                score += 1.0
+
         scores[n] = score
-    
-    # 7. 排序并返回
+
+    # 排序
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-    
-    # 主推：最高分
     best = ranked[0][0]
-    confidence = min(1.0, ranked[0][1] / 15)
-    
-    # 防守：2-4名，排除与主号冲突的
+    confidence = min(1.0, ranked[0][1] / 18)
     defenses = []
     for n, s in ranked[1:]:
         if n not in main_set and n != best:
             defenses.append(n)
             if len(defenses) >= 3:
                 break
-    
-    # 额外：如果防守不足3个，从高分中补充
     while len(defenses) < 3:
         for n, s in ranked:
             if n not in defenses and n != best and n not in main_set:
                 defenses.append(n)
                 break
-    
+
     return best, round(confidence, 3), defenses[:3]
 
+
+# ========== 三中三优化版 v2 ==========
+def get_trio_from_merged_pool20_v2(conn: sqlite3.Connection, issue_no: str) -> List[int]:
+    _, _, _, pool20, _ = _weighted_consensus_pools(conn, issue_no)
+    if not pool20 or len(pool20) < 3:
+        return [1, 2, 3]
+    all_pools = []
+    for strategy in STRATEGY_IDS:
+        run = conn.execute(
+            "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = ? AND status='PENDING'",
+            (issue_no, strategy)
+        ).fetchone()
+        if run:
+            p20 = get_pool_numbers_for_run(conn, run["id"], 20)
+            p20_filtered = [n for n in p20 if n in pool20]
+            all_pools.extend(p20_filtered)
+    if len(all_pools) < 3:
+        return pool20[:3]
+    appearance_count = Counter(all_pools)
+    diff_numbers = [n for n, c in appearance_count.items() if 1 <= c <= 2 and n in pool20]
+    if len(diff_numbers) < 6:
+        diff_numbers = [n for n, c in appearance_count.items() if c <= 3 and n in pool20]
+    if len(diff_numbers) < 3:
+        diff_numbers = pool20[:15]
+    draws = load_recent_draws(conn, FEATURE_WINDOW_DEFAULT)
+    if len(draws) < 3:
+        return diff_numbers[:3]
+    momentum = _momentum_map(draws)
+    freq = _freq_map(draws)
+    omission = _omission_map(draws)
+    momentum_norm = _normalize(momentum)
+    freq_norm = _normalize(freq)
+    omission_norm = _normalize(omission)
+    w_mom, w_hot, w_cold = get_trio_weights(conn, window=WEIGHT_WINDOW_DEFAULT)
+    scores = {}
+    for n in diff_numbers[:15]:
+        score = (w_mom * momentum_norm.get(n, 0) +
+                 w_hot * freq_norm.get(n, 0) +
+                 w_cold * omission_norm.get(n, 0))
+        score += (6 - appearance_count.get(n, 3)) * 0.15
+        scores[n] = score
+    sorted_nums = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    candidates = [n for n, _ in sorted_nums[:10]]
+
+    def is_valid(trio):
+        odd_cnt = sum(1 for x in trio if x % 2 == 1)
+        total = sum(trio)
+        return 1 <= odd_cnt <= 2 and 80 <= total <= 130
+
+    for i in range(len(candidates)):
+        for j in range(i+1, len(candidates)):
+            for k in range(j+1, len(candidates)):
+                trio = (candidates[i], candidates[j], candidates[k])
+                if is_valid(trio):
+                    return list(trio)
+    for i in range(len(candidates)):
+        for j in range(i+1, len(candidates)):
+            for k in range(j+1, len(candidates)):
+                trio = (candidates[i], candidates[j], candidates[k])
+                odd_cnt = sum(1 for x in trio if x % 2 == 1)
+                if 1 <= odd_cnt <= 2:
+                    return list(trio)
+    return candidates[:3] if len(candidates) >= 3 else pool20[:3]
+
+
+# ========== 集成策略 v3.1 ==========
 def _ensemble_strategy_v3_1(
     draws: List[List[int]],
     mined_config: Optional[Dict[str, float]],
@@ -1109,15 +1195,18 @@ def _ensemble_strategy_v3_1(
     conn: sqlite3.Connection,
     issue_no: str
 ) -> Tuple[List[Tuple[int, int, float, str]], int, float, Dict[int, float]]:
-    """Ensemble v3.1 - 加强版"""
     sub_strategies = ["hot_v1", "cold_rebound_v1", "momentum_v1", "balanced_v1", "pattern_mined_v1"]
     score_maps = []
     sub_picks = {}
+    bias_score, _ = detect_bias(conn, window=10)
+    adjusted_weights = adjust_weights_for_bias(strategy_weights, bias_score)
+    if bias_score > BIAS_THRESHOLD:
+        print(f"[集成策略] 偏态模式激活，偏态系数={bias_score:.2f}", flush=True)
 
     for sub in sub_strategies:
         win_size = get_adaptive_strategy_window(sub, conn)
         sub_draws = draws[:win_size] if len(draws) > win_size else draws
-        
+
         if sub == "pattern_mined_v1":
             cfg = mined_config or _default_mined_config()
             cfg["window"] = float(win_size)
@@ -1133,14 +1222,14 @@ def _ensemble_strategy_v3_1(
             else:
                 config.update({"w_freq": 0.40, "w_omit": 0.30, "w_mom": 0.20})
             _, _, _, score_map = _apply_weight_config(sub_draws, config, STRATEGY_LABELS.get(sub, sub))
-        
+
         score_maps.append(score_map)
         ranked = sorted(score_map.items(), key=lambda x: x[1], reverse=True)
         sub_picks[sub] = [n for n, _ in ranked[:6]]
 
     votes = {n: 0.0 for n in ALL_NUMBERS}
     for idx, sub in enumerate(sub_strategies):
-        w = strategy_weights.get(sub, 0.2)
+        w = adjusted_weights.get(sub, 0.2)
         ranked = sorted(score_maps[idx].items(), key=lambda x: x[1], reverse=True)
         for rank, (n, _) in enumerate(ranked):
             votes[n] += w * (49 - rank)
@@ -1153,7 +1242,7 @@ def _ensemble_strategy_v3_1(
     main_picked = _pick_top_six(voted, "集成投票v3.1")
 
     main6 = [n for n, _, _, _ in main_picked]
-    special_number, confidence, defenses = _generate_special_number_v2(conn, main6, issue_no)
+    special_number, confidence, _ = _generate_special_number_v4(conn, main6, issue_no)
 
     return main_picked, special_number, confidence, voted
 
@@ -1166,34 +1255,28 @@ def generate_strategy(
     conn: Optional[sqlite3.Connection] = None,
     issue_no: Optional[str] = None,
 ) -> Tuple[List[Tuple[int, int, float, str]], int, float, Dict[int, float]]:
-    
-    # === 策略专用窗口（核心优化点）===
+
     window_size = STRATEGY_BASE_WINDOWS.get(strategy, FEATURE_WINDOW_DEFAULT)
-    
-    # 确保窗口不超过可用历史
     strategy_draws = draws[:window_size] if len(draws) > window_size else draws
-    
+
     if strategy == "hot_v1":
         return _apply_weight_config(
             strategy_draws,
             {"window": float(window_size), "w_freq": 0.78, "w_omit": 0.05, "w_mom": 0.17},
             "热号策略"
         )
-    
     elif strategy == "cold_rebound_v1":
         return _apply_weight_config(
             strategy_draws,
             {"window": float(window_size), "w_freq": 0.05, "w_omit": 0.68, "w_mom": 0.27},
             "冷号回补"
         )
-    
     elif strategy == "momentum_v1":
         return _apply_weight_config(
             strategy_draws,
             {"window": float(window_size), "w_freq": 0.12, "w_omit": 0.05, "w_mom": 0.83},
             "近期动量"
         )
-    
     elif strategy == "balanced_v1":
         return _apply_weight_config(
             strategy_draws,
@@ -1207,13 +1290,11 @@ def generate_strategy(
             },
             "组合策略",
         )
-    
     elif strategy == "pattern_mined_v1":
         cfg = mined_config or _default_mined_config()
         cfg["window"] = float(window_size)
         return _apply_weight_config(strategy_draws, cfg, "规律挖掘")
-    
-    elif strategy == "ensemble_v2" or strategy == "ensemble_v3":
+    elif strategy in ("ensemble_v2", "ensemble_v3"):
         if strategy_weights is None:
             strategy_weights = get_strategy_weights(conn, window=WEIGHT_WINDOW_DEFAULT) if conn else {s: 1.0/len(STRATEGY_IDS) for s in STRATEGY_IDS}
         if conn is None:
@@ -1221,8 +1302,8 @@ def generate_strategy(
         if issue_no is None:
             raise ValueError("ensemble_v2/v3 requires issue_no parameter")
         return _ensemble_strategy_v3_1(strategy_draws, mined_config, strategy_weights, conn, issue_no)
-    
-    # 默认 fallback
+
+    # fallback
     return _apply_weight_config(
         strategy_draws,
         {
@@ -1741,7 +1822,6 @@ def print_recommendation_sheet(conn: sqlite3.Connection, limit: int = 8) -> None
 
 # ========== 动态权重相关函数 ==========
 def get_strategy_weights(conn: sqlite3.Connection, window: int = WEIGHT_WINDOW_DEFAULT) -> Dict[str, float]:
-    """最新版：规律挖掘强保护 + 平滑动态权重 + 特别号保护"""
     rows = conn.execute("""
         SELECT strategy, AVG(main_hit_count) as avg_hit
         FROM strategy_performance
@@ -1848,12 +1928,84 @@ def get_strategy_health(conn: sqlite3.Connection, window: int = HEALTH_WINDOW_DE
     return health
 
 
-# ========== 生肖相关函数 ==========
+# ========== 生肖相关函数（优化版） ==========
 def get_zodiac_by_number(number: int) -> str:
     for zodiac, nums in ZODIAC_MAP.items():
         if number in nums:
             return zodiac
     return "马"
+
+
+def _build_zodiac_scores_from_rows(rows: Sequence[sqlite3.Row], decay: float = 0.20) -> Dict[str, float]:
+    zodiac_scores: Dict[str, float] = {z: 0.0 for z in ZODIAC_MAP.keys()}
+    for idx, row in enumerate(rows):
+        recency_w = 1.0 / (1.0 + idx * decay)
+        numbers = json.loads(row["numbers_json"])
+        for n in numbers:
+            zodiac_scores[get_zodiac_by_number(int(n))] += 1.0 * recency_w
+        zodiac_scores[get_zodiac_by_number(int(row["special_number"]))] += 1.15 * recency_w
+    return zodiac_scores
+
+
+def get_two_zodiac_picks(conn: sqlite3.Connection, issue_no: str, window: int = 18) -> List[str]:
+    rows = conn.execute(
+        "SELECT numbers_json, special_number FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT ?",
+        (window,),
+    ).fetchall()
+    if not rows:
+        return ["马", "蛇"]
+
+    zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.20)
+    _, _, _, pool20, _ = _weighted_consensus_pools(conn, issue_no)
+    if pool20:
+        for idx, n in enumerate(pool20[:10]):
+            boost = 0.8 * (10 - idx) / 10.0
+            zodiac_scores[get_zodiac_by_number(int(n))] += boost
+    top_special_votes = get_top_special_votes(conn, issue_no, top_n=3)
+    if top_special_votes:
+        for sp in top_special_votes:
+            zodiac_scores[get_zodiac_by_number(sp)] += 1.2
+    recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:3]]
+    for z in recent_special_zodiacs:
+        zodiac_scores[z] -= 0.5
+    ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
+    return [ranked[0][0], ranked[1][0]] if len(ranked) >= 2 else ["马", "蛇"]
+
+
+def get_single_zodiac_pick(conn: sqlite3.Connection, issue_no: str, window: int = 18) -> str:
+    two_zodiac = get_two_zodiac_picks(conn, issue_no, window)
+    rows = conn.execute(
+        "SELECT numbers_json, special_number FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT ?",
+        (window,)
+    ).fetchall()
+    if not rows:
+        return two_zodiac[0] if two_zodiac else "马"
+
+    zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.20)
+    recent_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:12]]
+    zodiac_counter = Counter(recent_zodiacs)
+    if zodiac_counter:
+        coldest = min(zodiac_counter.keys(), key=lambda z: zodiac_counter[z])
+        zodiac_scores[coldest] += 2.0
+    _, _, _, pool20, _ = _weighted_consensus_pools(conn, issue_no)
+    if pool20:
+        pool_zodiacs = [get_zodiac_by_number(n) for n in pool20]
+        for z, cnt in Counter(pool_zodiacs).items():
+            zodiac_scores[z] += cnt * 0.4
+    top_special_votes = get_top_special_votes(conn, issue_no, top_n=3)
+    if top_special_votes:
+        for sp in top_special_votes:
+            zodiac_scores[get_zodiac_by_number(sp)] += 1.5
+    recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:3]]
+    for z in recent_special_zodiacs:
+        zodiac_scores[z] -= 0.8
+    for z in two_zodiac:
+        zodiac_scores[z] += 3.0
+    ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
+    for candidate, _ in ranked:
+        if candidate in two_zodiac:
+            return candidate
+    return ranked[0][0]
 
 
 def get_hot_cold_zodiacs(conn: sqlite3.Connection, window: int = 12, top_n: int = 3) -> Tuple[List[str], List[str]]:
@@ -1881,198 +2033,10 @@ def get_hot_cold_zodiacs(conn: sqlite3.Connection, window: int = 12, top_n: int 
     return hot, cold
 
 
-def get_zodiac_triplet_for_two_hits(conn: sqlite3.Connection, issue_no: str, window: int = 24) -> List[str]:
-    rows = conn.execute(
-        "SELECT numbers_json, special_number FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT ?",
-        (window,),
-    ).fetchall()
-    if not rows:
-        return ["马", "蛇", "龙"]
-
-    zodiac_scores = _build_zodiac_scores_from_rows(rows)
-
-    _, _, _, pool20, _ = _weighted_consensus_pools(conn, issue_no)
-    if pool20:
-        for idx, n in enumerate(pool20):
-            boost = (20 - idx) / 20.0
-            zodiac_scores[get_zodiac_by_number(int(n))] += 0.8 * boost
-
-    return _select_zodiac_triplet_from_scores(zodiac_scores)
-
-
-def _build_zodiac_scores_from_rows(rows: Sequence[sqlite3.Row]) -> Dict[str, float]:
-    zodiac_scores: Dict[str, float] = {z: 0.0 for z in ZODIAC_MAP.keys()}
-    for idx, row in enumerate(rows):
-        recency_w = 1.0 / (1.0 + idx * 0.25)
-        numbers = json.loads(row["numbers_json"])
-        for n in numbers:
-            zodiac_scores[get_zodiac_by_number(int(n))] += 1.0 * recency_w
-        zodiac_scores[get_zodiac_by_number(int(row["special_number"]))] += 1.15 * recency_w
-    return zodiac_scores
-
-
-def _select_zodiac_triplet_from_scores(zodiac_scores: Dict[str, float]) -> List[str]:
-    all_zodiacs = list(ZODIAC_MAP.keys())
-    best_triplet = ["马", "蛇", "龙"]
-    best_obj = -1e9
-    for a, b, c in combinations(all_zodiacs, 3):
-        trio = [a, b, c]
-        vals = [zodiac_scores[z] for z in trio]
-        total = sum(vals)
-        mn = min(vals)
-        mx = max(vals)
-        spread_penalty = (mx - mn) * 0.35
-        obj = total + mn * 0.9 - spread_penalty
-        if obj > best_obj:
-            best_obj = obj
-            best_triplet = trio
-    return best_triplet
-
-
-def _select_single_zodiac_from_scores(zodiac_scores: Dict[str, float]) -> str:
-    ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
-    return ranked[0][0] if ranked else "马"
-
-
-def get_single_zodiac_pick(conn: sqlite3.Connection, issue_no: str, window: int = 24) -> str:
-    rows = conn.execute(
-        "SELECT numbers_json, special_number FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT ?",
-        (window,)
-    ).fetchall()
-    if not rows:
-        return "马"
-    
-    zodiac_scores = _build_zodiac_scores_from_rows(rows)
-    
-    # 获取双生肖推荐作为强约束
-    two_zodiac = get_two_zodiac_picks(conn, issue_no, window)
-    
-    # 获取20码池和特别号投票
-    _, _, _, pool20, _ = _weighted_consensus_pools(conn, issue_no)
-    top_special_votes = get_top_special_votes(conn, issue_no, top_n=3)
-    
-    # 1. 生肖周期轮动（加强冷门补偿）
-    recent_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:12]]
-    zodiac_cycle_counter = Counter(recent_zodiacs)
-    if zodiac_cycle_counter:
-        coldest_zodiac = min(zodiac_cycle_counter.keys(), key=lambda z: zodiac_cycle_counter[z])
-        zodiac_scores[coldest_zodiac] += 2.5   # 从2.0提高到2.5
-    
-    # 2. 20码池关联（大幅提高）
-    if pool20:
-        pool_zodiacs = [get_zodiac_by_number(n) for n in pool20]
-        pool_zodiac_counter = Counter(pool_zodiacs)
-        for z, cnt in pool_zodiac_counter.items():
-            zodiac_scores[z] += cnt * 0.5     # 从0.35提高到0.5
-    
-    # 3. 特别号投票关联（大幅提高）
-    if top_special_votes:
-        special_zodiacs = [get_zodiac_by_number(n) for n in top_special_votes]
-        for z in special_zodiacs:
-            zodiac_scores[z] += 2.0           # 从1.5提高到2.0
-    
-    # 4. 近期降权（近期出现过的生肖大幅降权）
-    last_3_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:3]]
-    for z in last_3_zodiacs:
-        zodiac_scores[z] -= 1.0               # 从0.6提高到1.0
-    
-    # 5. 双生肖强约束：单生肖必须从双生肖中选择（如果双生肖命中率高）
-    # 先给双生肖中的每个生肖加高分
-    for z in two_zodiac:
-        zodiac_scores[z] += 3.0               # 强制引导到双生肖
-    
-    ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
-    
-    # 如果top1已经在双生肖中，直接返回；否则检查top2是否在双生肖中
-    if ranked[0][0] in two_zodiac:
-        return ranked[0][0]
-    for candidate, _ in ranked[1:]:
-        if candidate in two_zodiac:
-            return candidate
-    # 兜底
-    return ranked[0][0]
-
-
-def get_two_zodiac_picks(conn: sqlite3.Connection, issue_no: str, window: int = 24) -> List[str]:
-    rows = conn.execute(
-        "SELECT numbers_json, special_number FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT ?",
-        (window,),
-    ).fetchall()
-    if not rows:
-        return ["马", "蛇"]
-    zodiac_scores = _build_zodiac_scores_from_rows(rows)
-    _, _, _, pool20, _ = _weighted_consensus_pools(conn, issue_no)
-    if pool20:
-        for idx, n in enumerate(pool20):
-            boost = (20 - idx) / 20.0
-            zodiac_scores[get_zodiac_by_number(int(n))] += 0.9 * boost
-    ranked = [z for z, _ in sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))]
-    return ranked[:2] if len(ranked) >= 2 else ["马", "蛇"]
-
-
-def get_recent_zodiac_triplet_report(
-    conn: sqlite3.Connection,
-    lookback: int = 20,
-    history_window: int = 24,
-) -> Dict[str, float]:
-    rows = _draws_ordered_asc(conn)
-    if len(rows) < history_window + 1:
-        return {
-            "samples": 0.0,
-            "two_hit_rate": 0.0,
-            "one_hit_rate": 0.0,
-            "avg_hit": 0.0,
-            "max_miss_streak": 0.0,
-        }
-
-    start = max(history_window, len(rows) - lookback)
-    hit_counts: List[int] = []
-    miss_streak = 0
-    max_miss_streak = 0
-
-    for i in range(start, len(rows)):
-        history_rows = rows[max(0, i - history_window):i]
-        if len(history_rows) < history_window:
-            continue
-        zodiac_scores = _build_zodiac_scores_from_rows(list(reversed(history_rows)))
-        triplet = _select_zodiac_triplet_from_scores(zodiac_scores)
-
-        win_main = json.loads(rows[i]["numbers_json"])
-        win_special = int(rows[i]["special_number"])
-        winning_zodiacs = {get_zodiac_by_number(int(n)) for n in win_main}
-        winning_zodiacs.add(get_zodiac_by_number(win_special))
-        hit = len([z for z in triplet if z in winning_zodiacs])
-        hit_counts.append(hit)
-
-        if hit == 0:
-            miss_streak += 1
-            max_miss_streak = max(max_miss_streak, miss_streak)
-        else:
-            miss_streak = 0
-
-    if not hit_counts:
-        return {
-            "samples": 0.0,
-            "two_hit_rate": 0.0,
-            "one_hit_rate": 0.0,
-            "avg_hit": 0.0,
-            "max_miss_streak": 0.0,
-        }
-
-    samples = len(hit_counts)
-    return {
-        "samples": float(samples),
-        "two_hit_rate": float(sum(1 for x in hit_counts if x >= 2) / samples),
-        "one_hit_rate": float(sum(1 for x in hit_counts if x >= 1) / samples),
-        "avg_hit": float(sum(hit_counts) / samples),
-        "max_miss_streak": float(max_miss_streak),
-    }
-
-
 def get_recent_single_zodiac_report(
     conn: sqlite3.Connection,
     lookback: int = 20,
-    history_window: int = 24,
+    history_window: int = 18,
 ) -> Dict[str, float]:
     rows = _draws_ordered_asc(conn)
     if len(rows) < history_window + 1:
@@ -2087,8 +2051,7 @@ def get_recent_single_zodiac_report(
         history_rows = rows[max(0, i - history_window):i]
         if len(history_rows) < history_window:
             continue
-        zodiac_scores = _build_zodiac_scores_from_rows(list(reversed(history_rows)))
-        pick = _select_single_zodiac_from_scores(zodiac_scores)
+        pick = get_single_zodiac_pick(conn, rows[i]["issue_no"], window=history_window)
         win_main = json.loads(rows[i]["numbers_json"])
         win_special = int(rows[i]["special_number"])
         winning_zodiacs = {get_zodiac_by_number(int(n)) for n in win_main}
@@ -2114,7 +2077,7 @@ def get_recent_single_zodiac_report(
 def get_recent_two_zodiac_report(
     conn: sqlite3.Connection,
     lookback: int = 20,
-    history_window: int = 24,
+    history_window: int = 18,
 ) -> Dict[str, float]:
     rows = _draws_ordered_asc(conn)
     if len(rows) < history_window + 1:
@@ -2129,9 +2092,7 @@ def get_recent_two_zodiac_report(
         history_rows = rows[max(0, i - history_window):i]
         if len(history_rows) < history_window:
             continue
-        zodiac_scores = _build_zodiac_scores_from_rows(list(reversed(history_rows)))
-        ranked = [z for z, _ in sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))]
-        picks = ranked[:2]
+        picks = get_two_zodiac_picks(conn, rows[i]["issue_no"], window=history_window)
         win_main = json.loads(rows[i]["numbers_json"])
         win_special = int(rows[i]["special_number"])
         winning_zodiacs = {get_zodiac_by_number(int(n)) for n in win_main}
@@ -2154,24 +2115,6 @@ def get_recent_two_zodiac_report(
     }
 
 
-def get_top_two_zodiac_from_main(conn: sqlite3.Connection, window: int = 3) -> List[str]:
-    rows = conn.execute(
-        "SELECT numbers_json FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT ?",
-        (window,)
-    ).fetchall()
-    if len(rows) < window:
-        return ["马", "蛇"]
-    zodiac_counter = Counter()
-    for row in rows:
-        numbers = json.loads(row["numbers_json"])
-        for n in numbers:
-            zodiac_counter[get_zodiac_by_number(n)] += 1
-    top_two = [z for z, _ in zodiac_counter.most_common(2)]
-    while len(top_two) < 2:
-        top_two.append("马")
-    return top_two
-
-
 # ========== 特别号投票 ==========
 def get_top_special_votes(conn: sqlite3.Connection, issue_no: str, top_n: int = 3) -> List[int]:
     all_specials = []
@@ -2192,29 +2135,35 @@ def get_top_special_votes(conn: sqlite3.Connection, issue_no: str, top_n: int = 
 
 
 def get_special_recommendation(conn: sqlite3.Connection, issue_no: str, main6: Sequence[int]) -> Tuple[Optional[int], List[int], bool]:
-    top_votes = get_top_special_votes(conn, issue_no, top_n=6)
+    top_votes = get_top_special_votes(conn, issue_no, top_n=8)
     if not top_votes:
         return None, [], False
     mains = {int(n) for n in main6}
-    primary = int(top_votes[0])
+    recent_3_specials = [int(r["special_number"]) for r in conn.execute(
+        "SELECT special_number FROM draws ORDER BY draw_date DESC LIMIT 3"
+    ).fetchall()]
+    primary = None
+    for n in top_votes:
+        n_int = int(n)
+        if n_int not in mains and n_int not in recent_3_specials:
+            primary = n_int
+            break
+    if primary is None:
+        primary = int(top_votes[0])
     conflict = primary in mains
-    had_conflict = conflict
-    if conflict:
-        for n in top_votes[1:]:
-            if int(n) not in mains:
-                primary = int(n)
-                break
-    defenses: List[int] = []
+    defenses = []
     for n in top_votes:
         n_int = int(n)
         if n_int == primary or n_int in defenses:
             continue
         if n_int in mains:
             continue
+        if n_int in recent_3_specials:
+            continue
         defenses.append(n_int)
-        if len(defenses) >= 2:
+        if len(defenses) >= 3:
             break
-    return primary, defenses, had_conflict
+    return primary, defenses, conflict
 
 
 def _weighted_consensus_pools(conn: sqlite3.Connection, issue_no: str) -> Tuple[List[int], List[int], List[int], List[int], Optional[int]]:
@@ -2268,56 +2217,9 @@ def _weighted_consensus_pools(conn: sqlite3.Connection, issue_no: str) -> Tuple[
     return main6, pool10, pool14, pool20, special
 
 
-# ========== 三中三新逻辑（动态权重） ==========
-def get_merged_pool20(conn: sqlite3.Connection, issue_no: str) -> List[int]:
-    all_numbers = set()
-    for strategy in STRATEGY_IDS:
-        run = conn.execute(
-            "SELECT id FROM prediction_runs WHERE issue_no = ? AND strategy = ? AND status='PENDING'",
-            (issue_no, strategy)
-        ).fetchone()
-        if run:
-            pool20 = get_pool_numbers_for_run(conn, run["id"], 20)
-            all_numbers.update(pool20)
-    return sorted(all_numbers)
-
-
-def score_numbers_for_trio(conn: sqlite3.Connection, candidate_numbers: List[int]) -> Dict[int, float]:
-    draws = load_recent_draws(conn, FEATURE_WINDOW_DEFAULT)
-    if len(draws) < 3:
-        return {n: 0.0 for n in candidate_numbers}
-    momentum = _momentum_map(draws)
-    freq = _freq_map(draws)
-    omission = _omission_map(draws)
-    momentum_norm = _normalize(momentum)
-    freq_norm = _normalize(freq)
-    omission_norm = _normalize(omission)
-    w_mom, w_hot, w_cold = get_trio_weights(conn, window=WEIGHT_WINDOW_DEFAULT)
-    scores = {}
-    for n in candidate_numbers:
-        scores[n] = (w_mom * momentum_norm.get(n, 0) +
-                     w_hot * freq_norm.get(n, 0) +
-                     w_cold * omission_norm.get(n, 0))
-    return scores
-
-
+# ========== 三中三入口 ==========
 def get_trio_from_merged_pool20(conn: sqlite3.Connection, issue_no: str) -> List[int]:
-    merged_pool = get_merged_pool20(conn, issue_no)
-    if len(merged_pool) < 3:
-        return merged_pool[:3] if merged_pool else [1, 2, 3]
-    scores = score_numbers_for_trio(conn, merged_pool)
-    sorted_nums = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-    candidates = [n for n, _ in sorted_nums[:10]]
-    def is_valid(trio):
-        odd_cnt = sum(1 for x in trio if x % 2 == 1)
-        return 1 <= odd_cnt <= 2
-    for i in range(len(candidates)):
-        for j in range(i+1, len(candidates)):
-            for k in range(j+1, len(candidates)):
-                trio = (candidates[i], candidates[j], candidates[k])
-                if is_valid(trio):
-                    return list(trio)
-    return [candidates[0], candidates[1], candidates[2]]
+    return get_trio_from_merged_pool20_v2(conn, issue_no)
 
 
 # ========== 最终推荐函数 ==========
@@ -2338,8 +2240,8 @@ def get_final_recommendation(conn: sqlite3.Connection):
 
     predict_trio = get_trio_from_merged_pool20(conn, issue_no)
 
-    zodiac_single = get_single_zodiac_pick(conn, issue_no, window=24)
-    zodiac_two = get_two_zodiac_picks(conn, issue_no, window=24)
+    zodiac_single = get_single_zodiac_pick(conn, issue_no, window=18)
+    zodiac_two = get_two_zodiac_picks(conn, issue_no, window=18)
     return (
         issue_no,
         main6,
@@ -2495,14 +2397,14 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
             f"近1中率={hit1:.1f}% 近2中率={hit2:.1f}% 连挂={cold} 当前权重={weight:.1f}%"
         )
 
-    zodiac_report = get_recent_single_zodiac_report(conn, lookback=20, history_window=24)
+    zodiac_report = get_recent_single_zodiac_report(conn, lookback=20, history_window=18)
     print("\n单生肖复盘（最近20期）:")
     print(
         f"  - 最近样本={int(zodiac_report['samples'])}期 "
         f"命中率={zodiac_report['hit_rate'] * 100:.1f}% "
         f"最大连空={int(zodiac_report['max_miss_streak'])}"
     )
-    zodiac_two_report = get_recent_two_zodiac_report(conn, lookback=20, history_window=24)
+    zodiac_two_report = get_recent_two_zodiac_report(conn, lookback=20, history_window=18)
     print("双生肖复盘（最近20期）:")
     print(
         f"  - 最近样本={int(zodiac_two_report['samples'])}期 "
@@ -2665,7 +2567,7 @@ def cmd_mine(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="新澳门六合彩预测工具 - 动态权重 + 三中三 + 生肖推荐 (v3.1集成优化)")
+    p = argparse.ArgumentParser(description="新澳门六合彩预测工具 - v4全面优化版")
     p.add_argument("--db", default=DB_PATH_DEFAULT, help=f"SQLite db path (default: {DB_PATH_DEFAULT})")
     p.add_argument("--update", action="store_true", help="Quick sync from API (same as sync)")
     p.add_argument("--remine", action="store_true", help="Re-mine pattern config before sync/backtest")
