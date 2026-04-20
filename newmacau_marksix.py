@@ -1919,20 +1919,64 @@ def get_zodiac_by_number(number: int) -> str:
     return "马"
 
 def _get_previous_issue(conn: sqlite3.Connection, current_issue: str) -> Optional[str]:
-    """获取上一期的期号"""
+    """获取当前期号的上一期（按开奖日期和期号排序）"""
     row = conn.execute(
-        "SELECT issue_no FROM draws WHERE issue_no < ? ORDER BY draw_date DESC, issue_no DESC LIMIT 1",
-        (current_issue,)
+        """
+        SELECT issue_no FROM draws 
+        WHERE draw_date < (SELECT draw_date FROM draws WHERE issue_no = ?)
+           OR (draw_date = (SELECT draw_date FROM draws WHERE issue_no = ?) AND issue_no < ?)
+        ORDER BY draw_date DESC, issue_no DESC 
+        LIMIT 1
+        """,
+        (current_issue, current_issue, current_issue)
     ).fetchone()
     return row["issue_no"] if row else None
 
-def _check_two_zodiac_hit(conn: sqlite3.Connection, issue_no: str) -> bool:
-    """检查指定期号的双生肖推荐是否命中"""
-    # 获取该期推荐的双生肖（需要预测时已存储，但回测中是动态生成，此处简化判断）
-    # 实际在回测时可通过重新计算来验证，此处返回False表示默认触发补偿逻辑
-    # 生产环境中可查询 prediction_runs 中的特殊字段，但为简化，我们总是认为上一期如果没记录命中则触发
-    return False  # 保守策略：每次都补偿，但会通过下面实际计算优化
 
+def _check_two_zodiac_hit(conn: sqlite3.Connection, issue_no: str) -> bool:
+    """
+    检查指定期号的双生肖推荐是否命中。
+    由于预测时未存储双生肖推荐结果，这里实时计算该期的双生肖推荐并与实际开奖比对。
+    若该期尚无开奖数据，则返回 False（触发补偿）。
+    """
+    # 获取该期实际开奖数据
+    draw = conn.execute(
+        "SELECT numbers_json, special_number FROM draws WHERE issue_no = ?",
+        (issue_no,)
+    ).fetchone()
+    if not draw:
+        return False  # 无开奖数据，视为未命中以触发补偿
+
+    winning_main = json.loads(draw["numbers_json"])
+    winning_special = int(draw["special_number"])
+    winning_zodiacs = {get_zodiac_by_number(n) for n in winning_main}
+    winning_zodiacs.add(get_zodiac_by_number(winning_special))
+
+    # 重新生成该期的双生肖推荐（与当时预测逻辑一致）
+    # 注意：这里需要获取截止该期之前的历史数据窗口
+    rows = conn.execute(
+        """
+        SELECT numbers_json, special_number FROM draws 
+        WHERE draw_date < (SELECT draw_date FROM draws WHERE issue_no = ?)
+           OR (draw_date = (SELECT draw_date FROM draws WHERE issue_no = ?) AND issue_no < ?)
+        ORDER BY draw_date DESC, issue_no DESC 
+        LIMIT ?
+        """,
+        (issue_no, issue_no, issue_no, 16)  # window=16
+    ).fetchall()
+
+    if not rows:
+        return False
+
+    # 调用简化版双生肖计算（避免递归调用当前函数，直接使用得分逻辑）
+    zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.08)
+    # 结合20码池（注意：回测时可能没有预测池，这里可跳过或使用历史数据模拟）
+    # 为简化，此处不调用 _weighted_consensus_pools，仅用基础得分
+    ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
+    picks = [ranked[0][0], ranked[1][0]] if len(ranked) >= 2 else ["马", "蛇"]
+
+    # 判断是否命中
+    return any(z in winning_zodiacs for z in picks)
 
 def _zodiac_omission_map(rows: Sequence[sqlite3.Row]) -> Dict[str, int]:
     """计算每个生肖最近一次出现的期数距离（遗漏值）"""
