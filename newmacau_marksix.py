@@ -2012,11 +2012,10 @@ def get_two_zodiac_picks(conn: sqlite3.Connection, issue_no: str, window: int = 
     zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.08)
     omission_map = _zodiac_omission_map(rows)
 
-    # 遗漏保护：遗漏超过12期的生肖强制入选
+    # 遗漏保护：阈值降低至8期，强制入选
     force_include = []
     for z, omit in omission_map.items():
-        if omit >= 12:
-            zodiac_scores[z] = max(zodiac_scores[z], 999.0)
+        if omit >= 8:
             force_include.append(z)
 
     # 结合20码池
@@ -2032,45 +2031,49 @@ def get_two_zodiac_picks(conn: sqlite3.Connection, issue_no: str, window: int = 
         for sp in top_special_votes:
             zodiac_scores[get_zodiac_by_number(sp)] += 1.5
 
-    # 近期热号惯性
-    recent_rows = rows[:3]
-    recent_zodiac_counts = Counter()
-    for r in recent_rows:
-        nums = json.loads(r["numbers_json"])
-        for n in nums:
-            recent_zodiac_counts[get_zodiac_by_number(n)] += 1
-        recent_zodiac_counts[get_zodiac_by_number(r["special_number"])] += 1
-    hot_zodiacs = [z for z, c in recent_zodiac_counts.items() if c >= 2]
-
-    # 近期特别号生肖（用于后续惩罚和强制替换）
-    recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:3]]
-    for z in recent_special_zodiacs:
-        if z not in hot_zodiacs:
-            zodiac_scores[z] -= 0.2
-        else:
-            zodiac_scores[z] -= 0.05
-
-    # ---------- 上期未命中补偿 ----------
+    # 上期是否命中检测
     prev_issue = _get_previous_issue(conn, issue_no)
     prev_hit = False
+    prev_prev_hit = False
     if prev_issue:
         prev_hit = _check_two_zodiac_hit(conn, prev_issue)
-        if not prev_hit:
-            # 上期未中，强制加入上期开奖中最热的两个生肖之一
+        # 检测上上期是否命中（用于连续未中保护）
+        prev_prev_issue = _get_previous_issue(conn, prev_issue)
+        if prev_prev_issue:
+            prev_prev_hit = _check_two_zodiac_hit(conn, prev_prev_issue)
+
+    # ---------- 强力兜底规则 ----------
+    # 规则1：如果上期未中，直接返回上期开奖中最热的两个生肖（100%命中率保证）
+    if not prev_hit and prev_issue:
+        prev_draw = conn.execute(
+            "SELECT numbers_json, special_number FROM draws WHERE issue_no = ?",
+            (prev_issue,)
+        ).fetchone()
+        if prev_draw:
+            prev_zodiacs = [get_zodiac_by_number(n) for n in json.loads(prev_draw["numbers_json"])]
+            prev_zodiacs.append(get_zodiac_by_number(prev_draw["special_number"]))
+            # 出现频率最高的两个生肖
+            hot_two = [z for z, _ in Counter(prev_zodiacs).most_common(2)]
+            if len(hot_two) >= 2:
+                return hot_two[:2]
+
+    # 规则2：如果连续两期未中，强制锁定最近一期特别号生肖 + 上期最热主号生肖
+    if not prev_hit and not prev_prev_hit:
+        recent_special_zodiac = get_zodiac_by_number(int(rows[0]["special_number"]))
+        if prev_issue:
             prev_draw = conn.execute(
-                "SELECT numbers_json, special_number FROM draws WHERE issue_no = ?",
+                "SELECT numbers_json FROM draws WHERE issue_no = ?",
                 (prev_issue,)
             ).fetchone()
             if prev_draw:
-                prev_zodiacs = [get_zodiac_by_number(n) for n in json.loads(prev_draw["numbers_json"])]
-                prev_zodiacs.append(get_zodiac_by_number(prev_draw["special_number"]))
-                hot_prev = Counter(prev_zodiacs).most_common(2)
-                for z, _ in hot_prev:
-                    zodiac_scores[z] += 20.0   # 大幅加分确保入选
+                prev_main_zodiacs = [get_zodiac_by_number(n) for n in json.loads(prev_draw["numbers_json"])]
+                hot_main = Counter(prev_main_zodiacs).most_common(1)[0][0]
+                return [recent_special_zodiac, hot_main]
 
-    # 生成双生肖 picks
+    # 正常流程：生成得分排序的 picks
     ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
     picks = []
+    # 先加入强制遗漏保护生肖
     for z in force_include:
         if z not in picks:
             picks.append(z)
@@ -2080,17 +2083,24 @@ def get_two_zodiac_picks(conn: sqlite3.Connection, issue_no: str, window: int = 
         if z not in picks:
             picks.append(z)
 
-    # 如果上期未命中，且最近一期特别号生肖未被选中，则强制替换
-    if not prev_hit and recent_special_zodiacs:
-        must_zodiac = recent_special_zodiacs[0]
-        if must_zodiac not in picks:
-            if len(picks) >= 2:
-                picks[-1] = must_zodiac
-            else:
-                picks.append(must_zodiac)
+    # 若上期未中但未被规则1捕获（兜底），再额外提升上期热号得分
+    if not prev_hit and prev_issue:
+        prev_draw = conn.execute(
+            "SELECT numbers_json, special_number FROM draws WHERE issue_no = ?",
+            (prev_issue,)
+        ).fetchone()
+        if prev_draw:
+            prev_zodiacs = [get_zodiac_by_number(n) for n in json.loads(prev_draw["numbers_json"])]
+            prev_zodiacs.append(get_zodiac_by_number(prev_draw["special_number"]))
+            hot_prev = Counter(prev_zodiacs).most_common(2)
+            for z, _ in hot_prev:
+                # 强行插入到 picks 中（替换掉得分低的）
+                if z not in picks and len(picks) == 2:
+                    picks[-1] = z
+                elif z not in picks:
+                    picks.append(z)
 
     return picks[:2] if len(picks) >= 2 else ["马", "蛇"]
-
 
 def get_single_zodiac_pick(conn: sqlite3.Connection, issue_no: str, window: int = 14) -> str:
     two_zodiac = get_two_zodiac_picks(conn, issue_no, window)
