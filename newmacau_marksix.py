@@ -1919,7 +1919,7 @@ def get_zodiac_by_number(number: int) -> str:
     return "马"
 
 def _get_previous_issue(conn: sqlite3.Connection, current_issue: str) -> Optional[str]:
-    """获取当前期号的上一期（按开奖日期和期号排序）"""
+    """获取当前期号的上一期"""
     row = conn.execute(
         """
         SELECT issue_no FROM draws 
@@ -1932,28 +1932,21 @@ def _get_previous_issue(conn: sqlite3.Connection, current_issue: str) -> Optiona
     ).fetchone()
     return row["issue_no"] if row else None
 
-
 def _check_two_zodiac_hit(conn: sqlite3.Connection, issue_no: str) -> bool:
-    """
-    检查指定期号的双生肖推荐是否命中。
-    由于预测时未存储双生肖推荐结果，这里实时计算该期的双生肖推荐并与实际开奖比对。
-    若该期尚无开奖数据，则返回 False（触发补偿）。
-    """
-    # 获取该期实际开奖数据
+    """检查指定期号的双生肖推荐是否命中"""
     draw = conn.execute(
         "SELECT numbers_json, special_number FROM draws WHERE issue_no = ?",
         (issue_no,)
     ).fetchone()
     if not draw:
-        return False  # 无开奖数据，视为未命中以触发补偿
+        return False
 
     winning_main = json.loads(draw["numbers_json"])
     winning_special = int(draw["special_number"])
     winning_zodiacs = {get_zodiac_by_number(n) for n in winning_main}
     winning_zodiacs.add(get_zodiac_by_number(winning_special))
 
-    # 重新生成该期的双生肖推荐（与当时预测逻辑一致）
-    # 注意：这里需要获取截止该期之前的历史数据窗口
+    # 重新生成该期的双生肖推荐（与当前逻辑一致，但不包含上期补偿以避免递归）
     rows = conn.execute(
         """
         SELECT numbers_json, special_number FROM draws 
@@ -1962,20 +1955,15 @@ def _check_two_zodiac_hit(conn: sqlite3.Connection, issue_no: str) -> bool:
         ORDER BY draw_date DESC, issue_no DESC 
         LIMIT ?
         """,
-        (issue_no, issue_no, issue_no, 16)  # window=16
+        (issue_no, issue_no, issue_no, 16)
     ).fetchall()
-
     if not rows:
         return False
 
-    # 调用简化版双生肖计算（避免递归调用当前函数，直接使用得分逻辑）
     zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.08)
-    # 结合20码池（注意：回测时可能没有预测池，这里可跳过或使用历史数据模拟）
-    # 为简化，此处不调用 _weighted_consensus_pools，仅用基础得分
     ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
     picks = [ranked[0][0], ranked[1][0]] if len(ranked) >= 2 else ["马", "蛇"]
 
-    # 判断是否命中
     return any(z in winning_zodiacs for z in picks)
 
 def _zodiac_omission_map(rows: Sequence[sqlite3.Row]) -> Dict[str, int]:
@@ -2020,31 +2008,31 @@ def get_two_zodiac_picks(conn: sqlite3.Connection, issue_no: str, window: int = 
     if not rows:
         return ["马", "蛇"]
 
-    # 1. 基础得分计算
+    # 基础生肖得分
     zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.08)
-
-    # 2. 遗漏保护：遗漏超过12期的生肖强制加分至最高
     omission_map = _zodiac_omission_map(rows)
+
+    # 遗漏保护：遗漏超过12期的生肖强制入选
     force_include = []
     for z, omit in omission_map.items():
-        if omit >= 8:
-            zodiac_scores[z] = max(zodiac_scores[z], 999.0)  # 确保必选
+        if omit >= 12:
+            zodiac_scores[z] = max(zodiac_scores[z], 999.0)
             force_include.append(z)
 
-    # 3. 结合20码池
+    # 结合20码池
     _, _, _, pool20, _ = _weighted_consensus_pools(conn, issue_no)
     if pool20:
         pool_zodiacs = [get_zodiac_by_number(n) for n in pool20]
         for z, cnt in Counter(pool_zodiacs).items():
             zodiac_scores[z] += cnt * 0.6
 
-    # 4. 特别号投票前3生肖加分
+    # 特别号投票加分
     top_special_votes = get_top_special_votes(conn, issue_no, top_n=3)
     if top_special_votes:
         for sp in top_special_votes:
             zodiac_scores[get_zodiac_by_number(sp)] += 1.5
 
-    # 5. 近期热号惯性：最近3期内出现≥2次的生肖保留（防止被惩罚掉）
+    # 近期热号惯性
     recent_rows = rows[:3]
     recent_zodiac_counts = Counter()
     for r in recent_rows:
@@ -2054,21 +2042,21 @@ def get_two_zodiac_picks(conn: sqlite3.Connection, issue_no: str, window: int = 
         recent_zodiac_counts[get_zodiac_by_number(r["special_number"])] += 1
     hot_zodiacs = [z for z, c in recent_zodiac_counts.items() if c >= 2]
 
-    # 6. 减弱对近期已出特别号生肖的惩罚，并避免过度打压热号
+    # 近期特别号生肖（用于后续惩罚和强制替换）
     recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:3]]
     for z in recent_special_zodiacs:
         if z not in hot_zodiacs:
             zodiac_scores[z] -= 0.2
         else:
-            zodiac_scores[z] -= 0.05  # 热号只轻微惩罚
+            zodiac_scores[z] -= 0.05
 
-    # 7. 上期未命中补偿检测
-    # 获取上期双生肖推荐是否命中（通过复盘表查询）
+    # ---------- 上期未命中补偿 ----------
     prev_issue = _get_previous_issue(conn, issue_no)
+    prev_hit = False
     if prev_issue:
         prev_hit = _check_two_zodiac_hit(conn, prev_issue)
         if not prev_hit:
-            # 未命中，强制加入上期实际开奖中最热的两个生肖之一
+            # 上期未中，强制加入上期开奖中最热的两个生肖之一
             prev_draw = conn.execute(
                 "SELECT numbers_json, special_number FROM draws WHERE issue_no = ?",
                 (prev_issue,)
@@ -2078,9 +2066,9 @@ def get_two_zodiac_picks(conn: sqlite3.Connection, issue_no: str, window: int = 
                 prev_zodiacs.append(get_zodiac_by_number(prev_draw["special_number"]))
                 hot_prev = Counter(prev_zodiacs).most_common(2)
                 for z, _ in hot_prev:
-                    zodiac_scores[z] += 20.0  # 大幅加分确保入选
+                    zodiac_scores[z] += 20.0   # 大幅加分确保入选
 
-    # 8. 强制包含遗漏保护的生肖
+    # 生成双生肖 picks
     ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
     picks = []
     for z in force_include:
@@ -2092,7 +2080,7 @@ def get_two_zodiac_picks(conn: sqlite3.Connection, issue_no: str, window: int = 
         if z not in picks:
             picks.append(z)
 
-    # ---- 上期未命中补偿 ----
+    # 如果上期未命中，且最近一期特别号生肖未被选中，则强制替换
     if not prev_hit and recent_special_zodiacs:
         must_zodiac = recent_special_zodiacs[0]
         if must_zodiac not in picks:
@@ -2100,7 +2088,6 @@ def get_two_zodiac_picks(conn: sqlite3.Connection, issue_no: str, window: int = 
                 picks[-1] = must_zodiac
             else:
                 picks.append(must_zodiac)
-    # -----------------------
 
     return picks[:2] if len(picks) >= 2 else ["马", "蛇"]
 
