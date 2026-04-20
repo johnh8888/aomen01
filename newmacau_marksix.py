@@ -203,10 +203,10 @@ def set_model_state(conn: sqlite3.Connection, key: str, value: str) -> None:
         """,
         (key, value, now),
     )
-    def _pick(row: Dict[str, str], keys: Sequence[str]) -> str:
-    for k in keys:
+    def _pick(row: Dict[str, str], keys: Sequence[str]) -> str:              
+        for k in keys:
         if k in row and str(row[k]).strip():
-            return str(row[k]).strip()
+          return str(row[k]).strip()
     return ""
 
 
