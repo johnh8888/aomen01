@@ -1324,7 +1324,6 @@ strategy_draws,
 },
 "组合策略",
     )    
-    )
 def generate_predictions(conn: sqlite3.Connection, issue_no: Optional[str] = None) -> str:
 row = conn.execute("SELECT issue_no FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT 1").fetchone()
 if not row:
