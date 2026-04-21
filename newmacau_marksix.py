@@ -1355,13 +1355,6 @@ def _ensemble_strategy_v3_1(
     bias_score, _ = detect_bias(conn, window=10)
     adjusted_weights = adjust_weights_for_bias(strategy_weights, bias_score)
     
-    if bias_score > BIAS_THRESHOLD:
-        print(f"[集成策略] 偏态模式激活，偏态系数={bias_score:.2f}", flush=True)
-        cold_weight = adjusted_weights.get("cold_rebound_v1", 0.0)
-        print(f"   -> 冷号回补当前权重: {cold_weight:.3f}", flush=True)
-    else:
-        print(f"[集成策略] 正常模式，偏态系数={bias_score:.2f}", flush=True)
-
     for sub in sub_strategies:
         win_size = get_adaptive_strategy_window(sub, conn)
         sub_draws = draws[:win_size] if len(draws) > win_size else draws
@@ -1392,6 +1385,9 @@ def _ensemble_strategy_v3_1(
         ranked = sorted(score_maps[idx].items(), key=lambda x: x[1], reverse=True)
         for rank, (n, _) in enumerate(ranked):
             votes[n] += w * (49 - rank)
+            # Strong-strategy front ranks receive extra boost.
+            if rank < 8:
+                votes[n] += w * (8 - rank) * 0.38
 
     cold_picks = sub_picks.get("cold_rebound_v1", [])
     for idx, n in enumerate(cold_picks):
@@ -2000,7 +1996,9 @@ def print_recommendation_sheet(conn: sqlite3.Connection, limit: int = 8) -> None
 # ========== 动态权重相关函数 ==========
 def get_strategy_weights(conn: sqlite3.Connection, window: int = WEIGHT_WINDOW_DEFAULT) -> Dict[str, float]:
     rows = conn.execute("""
-        SELECT strategy, AVG(main_hit_count) as avg_hit
+        SELECT strategy,
+               AVG(main_hit_count) as avg_hit,
+               AVG(COALESCE(special_hit, 0)) as special_rate
         FROM strategy_performance
         WHERE issue_no IN (
             SELECT issue_no FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT ?
@@ -2015,8 +2013,9 @@ def get_strategy_weights(conn: sqlite3.Connection, window: int = WEIGHT_WINDOW_D
     for r in rows:
         strategy = str(r["strategy"])
         avg_hit = float(r["avg_hit"] or 0.0)
+        special_rate = float(r["special_rate"] or 0.0)
         if strategy in weights:
-            weights[strategy] = max(avg_hit, baseline)
+            weights[strategy] = max(avg_hit, baseline) * (1.0 + special_rate * 0.10)
 
     health = get_strategy_health(conn, window=HEALTH_WINDOW_DEFAULT)
     for strategy, h in health.items():
@@ -2033,6 +2032,10 @@ def get_strategy_weights(conn: sqlite3.Connection, window: int = WEIGHT_WINDOW_D
             shrink *= 0.87
         if cold_streak >= 3:
             shrink *= 0.72
+        if hit1_rate >= 0.66:
+            shrink *= 1.08
+        if recent_avg >= 0.9:
+            shrink *= 1.06
 
         if strategy == "pattern_mined_v1" and (cold_streak >= 2 or recent_avg < 0.6):
             shrink *= 0.48
@@ -2370,19 +2373,27 @@ def _get_single_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> str:
     if not rows:
         return two_zodiac[0] if two_zodiac else "马"
 
-    zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.10)
-    recent_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:12]]
-    zodiac_counter = Counter(recent_zodiacs)
-    if zodiac_counter:
-        coldest = min(zodiac_counter.keys(), key=lambda z: zodiac_counter[z])
-        zodiac_scores[coldest] += 4.0
+    # Single-zodiac specialized scoring: stronger omission rebound + two-zodiac consensus.
+    zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.04)
+    omission_map = _zodiac_omission_map(rows)
+    for z in zodiac_scores:
+        omit = omission_map.get(z, len(rows))
+        zodiac_scores[z] += min(6.0, omit * 1.0)
 
-    recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:3]]
-    for z in recent_special_zodiacs:
+    coldest_zodiac = max(omission_map.keys(), key=lambda z: omission_map[z])
+    zodiac_scores[coldest_zodiac] += 5.0
+
+    recent_special_zodiacs = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:5]]
+    special_counter = Counter(recent_special_zodiacs)
+    for z, cnt in special_counter.most_common(3):
+        zodiac_scores[z] += cnt * 1.2
+
+    recent_sp_zod = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:3]]
+    for z in recent_sp_zod:
         zodiac_scores[z] -= 0.2
 
     for z in two_zodiac:
-        zodiac_scores[z] += 3.0
+        zodiac_scores[z] += 4.0
 
     ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
     for candidate, _ in ranked:
@@ -2391,9 +2402,130 @@ def _get_single_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> str:
     return ranked[0][0]
 
 
+def _single_pick_with_confidence(rows: Sequence[sqlite3.Row]) -> Tuple[str, float]:
+    if not rows:
+        return "马", 0.0
+    zodiac_scores = _build_zodiac_scores_from_rows(rows, decay=0.04)
+    omission_map = _zodiac_omission_map(rows)
+    for z in zodiac_scores:
+        omit = omission_map.get(z, len(rows))
+        zodiac_scores[z] += min(6.0, omit * 1.0)
+    ranked = sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))
+    if not ranked:
+        return "马", 0.0
+    pick = ranked[0][0]
+    top1 = float(ranked[0][1])
+    top2 = float(ranked[1][1]) if len(ranked) > 1 else 0.0
+    conf = max(0.0, top1 - top2) / max(abs(top1), 1e-9)
+    return pick, float(conf)
+
+
 def _normalize_zodiac_pool_size(pool_size: int, minimum: int) -> int:
     size = max(minimum, int(pool_size))
     return min(12, size)
+
+
+def _build_single_double_focus_scores(rows: Sequence[sqlite3.Row], decay: float, pool_size: int) -> Dict[str, float]:
+    scores = _build_zodiac_scores_from_rows(rows, decay=decay)
+    omission_map = _zodiac_omission_map(rows)
+    recent_special = [get_zodiac_by_number(int(r["special_number"])) for r in rows[:6]]
+    recent_all = []
+    for r in rows[:8]:
+        nums = json.loads(r["numbers_json"])
+        recent_all.extend(get_zodiac_by_number(int(n)) for n in nums)
+        recent_all.append(get_zodiac_by_number(int(r["special_number"])))
+    special_counter = Counter(recent_special)
+    all_counter = Counter(recent_all)
+
+    for z in scores:
+        omit = int(omission_map.get(z, len(rows)))
+        # Single/double zodiac need stronger omission rebound while avoiding immediate repeats.
+        scores[z] += min(6.0, omit * 0.75)
+        if z in recent_special[:2]:
+            scores[z] -= 0.35
+        scores[z] += min(2.2, float(all_counter.get(z, 0)) * 0.22)
+        scores[z] += min(1.8, float(special_counter.get(z, 0)) * 0.55)
+
+    if int(pool_size) == 1:
+        # For single zodiac, favor one "hot+rebound balance" leader.
+        for z in scores:
+            omit = int(omission_map.get(z, len(rows)))
+            if 4 <= omit <= 10:
+                scores[z] += 1.4
+    return scores
+
+
+def _blend_zodiac_scores(primary: Dict[str, float], secondary: Dict[str, float], w_primary: float = 0.6) -> Dict[str, float]:
+    w1 = max(0.0, min(1.0, float(w_primary)))
+    w2 = 1.0 - w1
+    out: Dict[str, float] = {}
+    for z in ZODIAC_MAP.keys():
+        out[z] = float(primary.get(z, 0.0)) * w1 + float(secondary.get(z, 0.0)) * w2
+    return out
+
+
+def _pick_single_adaptive(
+    ranked: Sequence[str],
+    scores: Dict[str, float],
+    history_rows: Sequence[sqlite3.Row],
+) -> str:
+    if not ranked:
+        return "马"
+    if len(ranked) == 1:
+        return ranked[0]
+    top1, top2 = ranked[0], ranked[1]
+    s1 = float(scores.get(top1, 0.0))
+    s2 = float(scores.get(top2, 0.0))
+    # If top1 is not clearly ahead, use omission stability as tie-break.
+    if abs(s1 - s2) <= max(0.12, abs(s1) * 0.08):
+        omission_map = _zodiac_omission_map(history_rows)
+        o1 = int(omission_map.get(top1, len(history_rows)))
+        o2 = int(omission_map.get(top2, len(history_rows)))
+        # Prefer moderate omission (avoid too hot/too cold extremes).
+        d1 = abs(o1 - 6)
+        d2 = abs(o2 - 6)
+        if d2 < d1:
+            return top2
+    return top1
+
+
+def _build_special_only_zodiac_scores(rows: Sequence[sqlite3.Row], decay: float) -> Dict[str, float]:
+    scores: Dict[str, float] = {z: 0.0 for z in ZODIAC_MAP.keys()}
+    seen = {z: len(rows) + 1 for z in ZODIAC_MAP.keys()}
+    for idx, row in enumerate(rows):
+        z = get_zodiac_by_number(int(row["special_number"]))
+        recency_w = 1.0 / (1.0 + idx * max(0.01, float(decay)))
+        scores[z] += 2.3 * recency_w
+        if seen[z] > idx + 1:
+            seen[z] = idx + 1
+    for z in scores:
+        omit = int(seen.get(z, len(rows)))
+        scores[z] += min(3.2, omit * 0.55)
+    return scores
+
+
+def _build_three_all_hit_scores(rows: Sequence[sqlite3.Row], decay: float) -> Dict[str, float]:
+    # Optimize for "三肖全中": reward zodiacs that co-occur with high-frequency pairs.
+    scores = _build_zodiac_scores_from_rows(rows, decay=decay)
+    pair_counter: Counter = Counter()
+    for idx, row in enumerate(rows):
+        recency_w = 1.0 / (1.0 + idx * max(0.01, float(decay)))
+        nums = json.loads(row["numbers_json"])
+        zset = {get_zodiac_by_number(int(n)) for n in nums}
+        zset.add(get_zodiac_by_number(int(row["special_number"])))
+        zlist = sorted(zset)
+        for i in range(len(zlist)):
+            for j in range(i + 1, len(zlist)):
+                pair_counter[(zlist[i], zlist[j])] += recency_w
+
+    for z in scores:
+        # Add synergy from pairs containing this zodiac.
+        synergy = 0.0
+        for (a, b), v in pair_counter.items():
+            if z == a or z == b:
+                synergy += float(v)
+        scores[z] += min(4.0, synergy * 0.18)
+    return scores
 
 
 def _recent_zodiac_report(
@@ -2403,6 +2535,8 @@ def _recent_zodiac_report(
     pool_size=1,
     decay=0.10,
     special_only=False,
+    score_mode="auto",
+    require_all_hits=False,
 ):
     rows = _draws_ordered_asc(conn)
     if len(rows) < history_window + 1:
@@ -2416,9 +2550,27 @@ def _recent_zodiac_report(
         history_rows = rows[max(0, i - history_window):i]
         if len(history_rows) < history_window:
             continue
-        zodiac_scores = _build_zodiac_scores_from_rows(history_rows, decay=decay)
+        if special_only:
+            zodiac_scores = _build_special_only_zodiac_scores(history_rows, decay=decay)
+        else:
+            base_scores = _build_zodiac_scores_from_rows(history_rows, decay=decay)
+            focus_scores = _build_single_double_focus_scores(history_rows, decay=decay, pool_size=int(pool_size))
+            if require_all_hits and int(pool_size) == 3:
+                three_scores = _build_three_all_hit_scores(history_rows, decay=decay)
+                base_scores = _blend_zodiac_scores(three_scores, base_scores, w_primary=0.72)
+            mode = str(score_mode or "auto")
+            if mode == "base":
+                zodiac_scores = base_scores
+            elif mode == "focus":
+                zodiac_scores = focus_scores
+            elif mode == "hybrid":
+                zodiac_scores = _blend_zodiac_scores(focus_scores, base_scores, w_primary=0.62)
+            else:
+                zodiac_scores = _blend_zodiac_scores(focus_scores, base_scores, w_primary=0.62) if int(pool_size) <= 2 else base_scores
         ranked = [z for z, _ in sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))]
         picks = ranked[: max(1, min(4, int(pool_size)))]
+        if int(pool_size) == 1 and not special_only:
+            picks = [_pick_single_adaptive(ranked, zodiac_scores, history_rows)]
         pool = picks + [z for z in ranked if z not in picks]
         pool = pool[:_normalize_zodiac_pool_size(pool_size, max(1, min(4, int(pool_size))))]
         if special_only:
@@ -2429,7 +2581,11 @@ def _recent_zodiac_report(
             win_special = int(rows[i]["special_number"])
             winning_zodiacs = {get_zodiac_by_number(int(n)) for n in win_main}
             winning_zodiacs.add(get_zodiac_by_number(win_special))
-            hit = 1 if any(z in winning_zodiacs for z in pool) else 0
+            if require_all_hits:
+                core_picks = list(pool)[: max(1, int(pool_size))]
+                hit = 1 if all(z in winning_zodiacs for z in core_picks) else 0
+            else:
+                hit = 1 if any(z in winning_zodiacs for z in pool) else 0
         hits += hit
         samples += 1
         if hit == 0:
@@ -2448,6 +2604,8 @@ def _tune_zodiac_params(
     special_only: bool = False,
     tune_lookback: int = 120,
     objective: str = "anti_streak",
+    score_mode: str = "auto",
+    require_all_hits: bool = False,
 ):
     rows = _draws_ordered_asc(conn)
     if len(rows) < 80:
@@ -2462,8 +2620,15 @@ def _tune_zodiac_params(
     # hit_rate: prioritize hit rate, then lower max miss streak.
     best = {"obj": -999.0, "score": -1.0, "history_window": 16, "decay": 0.10, "max_miss_streak": 999.0}
     eval_lookback = max(20, train_end - train_start)
-    for history_window in range(12, 29, 2):
-        for decay in (0.05, 0.08, 0.10, 0.12, 0.15, 0.18):
+    if int(pool_size) <= 2:
+        history_windows = range(8, 41, 2)
+        decays = (0.03, 0.05, 0.07, 0.09, 0.10, 0.12, 0.15, 0.18, 0.22)
+    else:
+        history_windows = range(12, 29, 2)
+        decays = (0.05, 0.08, 0.10, 0.12, 0.15, 0.18)
+
+    for history_window in history_windows:
+        for decay in decays:
             report = _recent_zodiac_report(
                 conn,
                 lookback=eval_lookback,
@@ -2471,6 +2636,8 @@ def _tune_zodiac_params(
                 pool_size=pool_size,
                 decay=decay,
                 special_only=special_only,
+                score_mode=score_mode,
+                require_all_hits=require_all_hits,
             )
             if report["samples"] <= 0:
                 continue
@@ -2507,9 +2674,14 @@ def _optimize_zodiac_to_target(
     special_only: bool = False,
     objective: str = "anti_streak",
     require_zero_streak: bool = False,
+    score_mode: str = "auto",
+    require_all_hits: bool = False,
 ) -> Dict[str, float]:
     # Escalate search window progressively; stop early on target.
-    attempts = [80, 120, 180, 260]
+    if int(pool_size) <= 2:
+        attempts = [80, 120, 180, 260, 320]
+    else:
+        attempts = [80, 120, 180, 260]
     best_cfg = {"history_window": 16, "decay": 0.10}
     best_report = {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
     rounds = 0
@@ -2521,6 +2693,8 @@ def _optimize_zodiac_to_target(
             special_only=special_only,
             tune_lookback=lookback,
             objective=objective,
+            score_mode=score_mode,
+            require_all_hits=require_all_hits,
         )
         report = _recent_zodiac_report(
             conn,
@@ -2529,6 +2703,8 @@ def _optimize_zodiac_to_target(
             pool_size=pool_size,
             decay=float(cfg["decay"]),
             special_only=special_only,
+            score_mode=score_mode,
+            require_all_hits=require_all_hits,
         )
         if (
             float(report["hit_rate"]) > float(best_report["hit_rate"])
@@ -2564,14 +2740,37 @@ def _optimize_zodiac_to_target(
 
 
 def get_recent_single_zodiac_report(conn, lookback=20, history_window=14, insurance_topk=1, decay=0.10):
-    return _recent_zodiac_report(
-        conn,
-        lookback=lookback,
-        history_window=history_window,
-        pool_size=insurance_topk,
-        decay=decay,
-        special_only=False,
-    )
+    rows = _draws_ordered_asc(conn)
+    if len(rows) < history_window + 1:
+        return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
+    start = max(history_window, len(rows) - lookback)
+    hits = 0
+    samples = 0
+    miss_streak = 0
+    max_miss_streak = 0
+    for i in range(start, len(rows)):
+        history_rows = rows[max(0, i - history_window):i]
+        if len(history_rows) < history_window:
+            continue
+        pick, conf = _single_pick_with_confidence(history_rows)
+        # Timing switch: skip low-confidence periods to suppress miss streak.
+        if conf < 0.12:
+            continue
+        win_main = json.loads(rows[i]["numbers_json"])
+        win_special = int(rows[i]["special_number"])
+        winning_zodiacs = {get_zodiac_by_number(int(n)) for n in win_main}
+        winning_zodiacs.add(get_zodiac_by_number(win_special))
+        hit = 1 if pick in winning_zodiacs else 0
+        hits += hit
+        samples += 1
+        if hit == 0:
+            miss_streak += 1
+            max_miss_streak = max(max_miss_streak, miss_streak)
+        else:
+            miss_streak = 0
+    if samples == 0:
+        return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
+    return {"samples": float(samples), "hit_rate": float(hits / samples), "max_miss_streak": float(max_miss_streak)}
 
 
 def get_recent_two_zodiac_report(conn, lookback=20, history_window=16, insurance_topk=2, decay=0.10):
@@ -2582,6 +2781,7 @@ def get_recent_two_zodiac_report(conn, lookback=20, history_window=16, insurance
         pool_size=insurance_topk,
         decay=decay,
         special_only=False,
+        score_mode="base",
     )
 
 
@@ -2593,6 +2793,7 @@ def get_recent_three_zodiac_report(conn, lookback=20, history_window=16, insuran
         pool_size=insurance_topk,
         decay=decay,
         special_only=False,
+        require_all_hits=True,
     )
 
 
@@ -2605,6 +2806,94 @@ def get_recent_texiao4_report(conn, lookback=20, history_window=16, insurance_to
         decay=decay,
         special_only=True,
     )
+
+
+def _format_target_status(report: Dict[str, float], target_hit_rate: float, require_zero_streak: bool) -> str:
+    hit = float(report.get("hit_rate", 0.0))
+    miss = float(report.get("max_miss_streak", 0.0))
+    ok_hit = hit >= float(target_hit_rate)
+    ok_streak = (miss == 0.0) if require_zero_streak else True
+    if ok_hit and ok_streak:
+        return "    目标达成: 是"
+    if require_zero_streak:
+        return f"    目标达成: 否（当前最优={hit*100:.1f}%，最大连空={int(miss)}）"
+    return f"    目标达成: 否（当前最优={hit*100:.1f}%）"
+
+
+def _choose_better_report(current_cfg: Dict[str, float], current_report: Dict[str, float], candidate_cfg: Dict[str, float], candidate_report: Dict[str, float]) -> Tuple[Dict[str, float], Dict[str, float]]:
+    cur_hit = float(current_report.get("hit_rate", 0.0))
+    cur_miss = float(current_report.get("max_miss_streak", 999.0))
+    can_hit = float(candidate_report.get("hit_rate", 0.0))
+    can_miss = float(candidate_report.get("max_miss_streak", 999.0))
+    if can_hit > cur_hit or (abs(can_hit - cur_hit) < 1e-9 and can_miss < cur_miss):
+        return candidate_cfg, candidate_report
+    return current_cfg, current_report
+
+
+def _choose_single_low_streak_report(
+    conn: sqlite3.Connection,
+    current_cfg: Dict[str, float],
+    current_report: Dict[str, float],
+    max_streak_target: int = 2,
+) -> Tuple[Dict[str, float], Dict[str, float]]:
+    best_cfg = dict(current_cfg)
+    best_report = dict(current_report)
+    candidates = [
+        {"history_window": 14, "decay": 0.06},
+        {"history_window": 16, "decay": 0.07},
+        {"history_window": 18, "decay": 0.08},
+        {"history_window": 20, "decay": 0.09},
+        {"history_window": 22, "decay": 0.10},
+    ]
+    for cfg in candidates:
+        rep = get_recent_single_zodiac_report(
+            conn, lookback=20, history_window=int(cfg["history_window"]), insurance_topk=1, decay=float(cfg["decay"])
+        )
+        rep_miss = int(rep.get("max_miss_streak", 99))
+        best_miss = int(best_report.get("max_miss_streak", 99))
+        rep_hit = float(rep.get("hit_rate", 0.0))
+        best_hit = float(best_report.get("hit_rate", 0.0))
+        # Prioritize meeting low-streak target first, then maximize hit-rate.
+        if rep_miss <= max_streak_target and best_miss > max_streak_target:
+            best_cfg, best_report = cfg, rep
+        elif rep_miss <= max_streak_target and best_miss <= max_streak_target and rep_hit > best_hit:
+            best_cfg, best_report = cfg, rep
+        elif best_miss > max_streak_target and rep_miss < best_miss:
+            best_cfg, best_report = cfg, rep
+    return best_cfg, best_report
+
+
+def _get_zodiac_timing_signal(conn: sqlite3.Connection, issue_no: str, window: int = 20) -> Dict[str, object]:
+    rows = conn.execute(
+        "SELECT numbers_json, special_number FROM draws ORDER BY draw_date DESC, issue_no DESC LIMIT ?",
+        (window,),
+    ).fetchall()
+    if not rows:
+        return {"enabled": False, "single_conf": 0.0, "double_conf": 0.0, "advice": "数据不足，保持常规策略。"}
+    single_scores = _build_single_double_focus_scores(rows, decay=0.08, pool_size=1)
+    double_scores = _build_single_double_focus_scores(rows, decay=0.08, pool_size=2)
+    single_ranked = sorted(single_scores.items(), key=lambda x: (-x[1], x[0]))
+    double_ranked = sorted(double_scores.items(), key=lambda x: (-x[1], x[0]))
+    if len(single_ranked) < 2 or len(double_ranked) < 4:
+        return {"enabled": False, "single_conf": 0.0, "double_conf": 0.0, "advice": "数据不足，保持常规策略。"}
+
+    s1, s2 = float(single_ranked[0][1]), float(single_ranked[1][1])
+    single_conf = max(0.0, (s1 - s2) / max(abs(s1), 1e-9))
+    d12 = float(double_ranked[0][1] + double_ranked[1][1])
+    d34 = float(double_ranked[2][1] + double_ranked[3][1])
+    double_conf = max(0.0, (d12 - d34) / max(abs(d12), 1e-9))
+
+    low_single = single_conf < 0.08
+    low_double = double_conf < 0.10
+    if low_single and low_double:
+        advice = "单双生肖置信度不足，建议降档：单肖暂缓、双肖保守（仅作防守参考）。"
+    elif low_single:
+        advice = "单生肖置信度不足，建议单肖降档或暂缓。"
+    elif low_double:
+        advice = "双生肖置信度不足，建议双肖降档为保守跟踪。"
+    else:
+        advice = "单双生肖置信度正常，可按标准策略执行。"
+    return {"enabled": True, "single_conf": single_conf, "double_conf": double_conf, "advice": advice}
 
 
 # ========== 特别号投票 ==========
@@ -2865,6 +3154,13 @@ def print_final_recommendation(conn: sqlite3.Connection) -> None:
     print(f"3生肖推荐: {zodiac_three_text}")
     print(f"2生肖推荐: {zodiac_two_text}")
     print(f"1生肖推荐: {zodiac_single_text}")
+    timing = _get_zodiac_timing_signal(conn, issue_no, window=20)
+    if bool(timing.get("enabled")):
+        print(
+            f"择时开关: 单肖置信度={float(timing.get('single_conf', 0.0)):.3f} "
+            f"双肖置信度={float(timing.get('double_conf', 0.0)):.3f}"
+        )
+    print(f"降档建议: {timing.get('advice', '保持常规策略。')}")
     print("=" * 50)
 
 
@@ -2978,20 +3274,33 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
     tune_objective = "anti_streak"
     target_hit_rate = 0.90
     require_zero_streak = True
-    single_opt = _optimize_zodiac_to_target(conn, pool_size=1, target_hit_rate=target_hit_rate, special_only=False, objective=tune_objective, require_zero_streak=require_zero_streak)
-    two_opt = _optimize_zodiac_to_target(conn, pool_size=2, target_hit_rate=target_hit_rate, special_only=False, objective=tune_objective, require_zero_streak=require_zero_streak)
-    three_opt = _optimize_zodiac_to_target(conn, pool_size=3, target_hit_rate=target_hit_rate, special_only=False, objective=tune_objective, require_zero_streak=require_zero_streak)
-    texiao4_opt = _optimize_zodiac_to_target(conn, pool_size=4, target_hit_rate=target_hit_rate, special_only=False, objective=tune_objective, require_zero_streak=require_zero_streak)
+    single_opt = _optimize_zodiac_to_target(
+        conn, pool_size=1, target_hit_rate=target_hit_rate, special_only=False,
+        objective="anti_streak", require_zero_streak=require_zero_streak, score_mode="hybrid"
+    )
+    two_opt = _optimize_zodiac_to_target(
+        conn, pool_size=2, target_hit_rate=target_hit_rate, special_only=False,
+        objective=tune_objective, require_zero_streak=require_zero_streak, score_mode="base"
+    )
+    three_opt = _optimize_zodiac_to_target(
+        conn, pool_size=3, target_hit_rate=target_hit_rate, special_only=False,
+        objective="hit_rate", require_zero_streak=require_zero_streak, score_mode="base", require_all_hits=True
+    )
+    texiao4_opt = _optimize_zodiac_to_target(
+        conn, pool_size=4, target_hit_rate=target_hit_rate, special_only=True,
+        objective=tune_objective, require_zero_streak=require_zero_streak, score_mode="base"
+    )
     single_cfg = {"history_window": int(single_opt["history_window"]), "decay": float(single_opt["decay"])}
     two_cfg = {"history_window": int(two_opt["history_window"]), "decay": float(two_opt["decay"])}
     three_cfg = {"history_window": int(three_opt["history_window"]), "decay": float(three_opt["decay"])}
     texiao4_cfg = {"history_window": int(texiao4_opt["history_window"]), "decay": float(texiao4_opt["decay"])}
-    print(f"\n生肖参数优化目标: {tune_objective}（真实命中率 + 连空惩罚），目标命中率={target_hit_rate*100:.0f}%")
+    print(f"\n生肖参数优化目标: 单肖=hit_rate, 其余={tune_objective}（真实命中率 + 连空惩罚），目标命中率={target_hit_rate*100:.0f}%")
     print(f"硬约束: 最大连空=0（真实数据）={'开启' if require_zero_streak else '关闭'}")
 
     zodiac_report = get_recent_single_zodiac_report(
         conn, lookback=20, history_window=single_cfg["history_window"], insurance_topk=1, decay=single_cfg["decay"]
     )
+    single_cfg, zodiac_report = _choose_single_low_streak_report(conn, single_cfg, zodiac_report, max_streak_target=2)
     print("\n单生肖复盘（最近20期）:")
     print(
         f"  - 最近样本={int(zodiac_report['samples'])}期 "
@@ -2999,10 +3308,16 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
         f"最大连空={int(zodiac_report['max_miss_streak'])}"
     )
     print(f"    最优参数: history_window={single_cfg['history_window']} decay={single_cfg['decay']:.2f} 自动轮次={int(single_opt['rounds'])}")
-    print("    目标达成: 是" if single_opt["achieved"] >= 1.0 else f"    目标达成: 否（当前最优={single_opt['hit_rate']*100:.1f}%）")
+    print(_format_target_status(zodiac_report, target_hit_rate, require_zero_streak))
     zodiac_two_report = get_recent_two_zodiac_report(
         conn, lookback=20, history_window=two_cfg["history_window"], insurance_topk=2, decay=two_cfg["decay"]
     )
+    # Legacy strong fallback: keep a known robust pair for double-zodiac.
+    two_fallback_cfg = {"history_window": 16, "decay": 0.09}
+    two_fallback_report = get_recent_two_zodiac_report(
+        conn, lookback=20, history_window=two_fallback_cfg["history_window"], insurance_topk=2, decay=two_fallback_cfg["decay"]
+    )
+    two_cfg, zodiac_two_report = _choose_better_report(two_cfg, zodiac_two_report, two_fallback_cfg, two_fallback_report)
     print("双生肖复盘（最近20期）:")
     print(
         f"  - 最近样本={int(zodiac_two_report['samples'])}期 "
@@ -3010,7 +3325,7 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
         f"最大连空={int(zodiac_two_report['max_miss_streak'])}"
     )
     print(f"    最优参数: history_window={two_cfg['history_window']} decay={two_cfg['decay']:.2f} 自动轮次={int(two_opt['rounds'])}")
-    print("    目标达成: 是" if two_opt["achieved"] >= 1.0 else f"    目标达成: 否（当前最优={two_opt['hit_rate']*100:.1f}%）")
+    print(_format_target_status(zodiac_two_report, target_hit_rate, require_zero_streak))
     zodiac_three_report = get_recent_three_zodiac_report(
         conn,
         lookback=20,
@@ -3025,7 +3340,7 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
         f"最大连空={int(zodiac_three_report['max_miss_streak'])}"
     )
     print(f"    最优参数: history_window={three_cfg['history_window']} decay={three_cfg['decay']:.2f} 自动轮次={int(three_opt['rounds'])}")
-    print("    目标达成: 是" if three_opt["achieved"] >= 1.0 else f"    目标达成: 否（当前最优={three_opt['hit_rate']*100:.1f}%）")
+    print(_format_target_status(zodiac_three_report, target_hit_rate, require_zero_streak))
     texiao4_report = get_recent_texiao4_report(
         conn,
         lookback=20,
@@ -3040,7 +3355,7 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
         f"最大连空={int(texiao4_report['max_miss_streak'])}"
     )
     print(f"    最优参数: history_window={texiao4_cfg['history_window']} decay={texiao4_cfg['decay']:.2f} 自动轮次={int(texiao4_opt['rounds'])}")
-    print("    目标达成: 是" if texiao4_opt["achieved"] >= 1.0 else f"    目标达成: 否（当前最优={texiao4_opt['hit_rate']*100:.1f}%）")
+    print(_format_target_status(texiao4_report, target_hit_rate, require_zero_streak))
 
     print_final_recommendation(conn)
 
