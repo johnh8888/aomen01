@@ -2391,7 +2391,19 @@ def _get_single_zodiac_from_history_rows(rows: Sequence[sqlite3.Row]) -> str:
     return ranked[0][0]
 
 
-def get_recent_single_zodiac_report(conn, lookback=20, history_window=14, insurance_topk=12):
+def _normalize_zodiac_pool_size(pool_size: int, minimum: int) -> int:
+    size = max(minimum, int(pool_size))
+    return min(12, size)
+
+
+def _recent_zodiac_report(
+    conn,
+    lookback=20,
+    history_window=16,
+    pool_size=1,
+    decay=0.10,
+    special_only=False,
+):
     rows = _draws_ordered_asc(conn)
     if len(rows) < history_window + 1:
         return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
@@ -2404,86 +2416,20 @@ def get_recent_single_zodiac_report(conn, lookback=20, history_window=14, insura
         history_rows = rows[max(0, i - history_window):i]
         if len(history_rows) < history_window:
             continue
-        zodiac_scores = _build_zodiac_scores_from_rows(history_rows, decay=0.10)
-        pick = _get_single_zodiac_from_history_rows(history_rows)
+        zodiac_scores = _build_zodiac_scores_from_rows(history_rows, decay=decay)
         ranked = [z for z, _ in sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))]
-        pool = [pick] + [z for z in ranked if z != pick]
-        pool = pool[: max(1, int(insurance_topk))]
-        win_main = json.loads(rows[i]["numbers_json"])
-        win_special = int(rows[i]["special_number"])
-        winning_zodiacs = {get_zodiac_by_number(int(n)) for n in win_main}
-        winning_zodiacs.add(get_zodiac_by_number(win_special))
-        hit = 1 if any(z in winning_zodiacs for z in pool) else 0
-        hits += hit
-        samples += 1
-        if hit == 0:
-            miss_streak += 1
-            max_miss_streak = max(max_miss_streak, miss_streak)
-        else:
-            miss_streak = 0
-    if samples == 0:
-        return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
-    return {"samples": float(samples), "hit_rate": float(hits / samples), "max_miss_streak": 0.0}
-
-
-def get_recent_two_zodiac_report(conn, lookback=20, history_window=16, insurance_topk=12):
-    rows = _draws_ordered_asc(conn)
-    if len(rows) < history_window + 1:
-        return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
-    start = max(history_window, len(rows) - lookback)
-    hits = 0
-    samples = 0
-    miss_streak = 0
-    max_miss_streak = 0
-    for i in range(start, len(rows)):
-        history_rows = rows[max(0, i - history_window):i]
-        if len(history_rows) < history_window:
-            continue
-        zodiac_scores = _build_zodiac_scores_from_rows(history_rows, decay=0.10)
-        picks = _get_two_zodiac_from_history_rows(history_rows)
-        ranked = [z for z, _ in sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))]
-        pool = list(picks) + [z for z in ranked if z not in picks]
-        pool = pool[: max(2, int(insurance_topk))]
-        win_main = json.loads(rows[i]["numbers_json"])
-        win_special = int(rows[i]["special_number"])
-        winning_zodiacs = {get_zodiac_by_number(int(n)) for n in win_main}
-        winning_zodiacs.add(get_zodiac_by_number(win_special))
-        hit = 1 if any(z in winning_zodiacs for z in pool) else 0
-        hits += hit
-        samples += 1
-        if hit == 0:
-            miss_streak += 1
-            max_miss_streak = max(max_miss_streak, miss_streak)
-        else:
-            miss_streak = 0
-    if samples == 0:
-        return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
-    return {"samples": float(samples), "hit_rate": float(hits / samples), "max_miss_streak": 0.0}
-
-
-def get_recent_three_zodiac_report(conn, lookback=20, history_window=16, insurance_topk=12):
-    rows = _draws_ordered_asc(conn)
-    if len(rows) < history_window + 1:
-        return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
-    start = max(history_window, len(rows) - lookback)
-    hits = 0
-    samples = 0
-    miss_streak = 0
-    max_miss_streak = 0
-    for i in range(start, len(rows)):
-        history_rows = rows[max(0, i - history_window):i]
-        if len(history_rows) < history_window:
-            continue
-        zodiac_scores = _build_zodiac_scores_from_rows(history_rows, decay=0.08)
-        ranked = [z for z, _ in sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))]
-        picks = ranked[:3] if len(ranked) >= 3 else ["马", "蛇", "龙"]
+        picks = ranked[: max(1, min(4, int(pool_size)))]
         pool = picks + [z for z in ranked if z not in picks]
-        pool = pool[: max(3, int(insurance_topk))]
-        win_main = json.loads(rows[i]["numbers_json"])
-        win_special = int(rows[i]["special_number"])
-        winning_zodiacs = {get_zodiac_by_number(int(n)) for n in win_main}
-        winning_zodiacs.add(get_zodiac_by_number(win_special))
-        hit = 1 if any(z in winning_zodiacs for z in pool) else 0
+        pool = pool[:_normalize_zodiac_pool_size(pool_size, max(1, min(4, int(pool_size))))]
+        if special_only:
+            win_special = int(rows[i]["special_number"])
+            hit = 1 if get_zodiac_by_number(win_special) in pool else 0
+        else:
+            win_main = json.loads(rows[i]["numbers_json"])
+            win_special = int(rows[i]["special_number"])
+            winning_zodiacs = {get_zodiac_by_number(int(n)) for n in win_main}
+            winning_zodiacs.add(get_zodiac_by_number(win_special))
+            hit = 1 if any(z in winning_zodiacs for z in pool) else 0
         hits += hit
         samples += 1
         if hit == 0:
@@ -2493,33 +2439,109 @@ def get_recent_three_zodiac_report(conn, lookback=20, history_window=16, insuran
             miss_streak = 0
     if samples == 0:
         return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
-    return {"samples": float(samples), "hit_rate": float(hits / samples), "max_miss_streak": 0.0}
+    return {"samples": float(samples), "hit_rate": float(hits / samples), "max_miss_streak": float(max_miss_streak)}
 
 
-def get_recent_texiao4_report(conn, lookback=20, history_window=16, insurance_topk=12):
+def _tune_zodiac_params(
+    conn,
+    pool_size: int,
+    special_only: bool = False,
+    tune_lookback: int = 120,
+    objective: str = "anti_streak",
+):
     rows = _draws_ordered_asc(conn)
-    if len(rows) < history_window + 1:
-        return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
-    start = max(history_window, len(rows) - lookback)
-    hits = 0
-    samples = 0
-    for i in range(start, len(rows)):
-        history_rows = rows[max(0, i - history_window):i]
-        if len(history_rows) < history_window:
-            continue
-        zodiac_scores = _build_zodiac_scores_from_rows(history_rows, decay=0.08)
-        ranked = [z for z, _ in sorted(zodiac_scores.items(), key=lambda x: (-x[1], x[0]))]
-        picks = ranked[:4] if len(ranked) >= 4 else ranked
-        pool = picks + [z for z in ranked if z not in picks]
-        pool = pool[: max(4, int(insurance_topk))]
-        win_special = int(rows[i]["special_number"])
-        win_z = get_zodiac_by_number(win_special)
-        hit = 1 if win_z in pool else 0
-        hits += hit
-        samples += 1
-    if samples == 0:
-        return {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
-    return {"samples": float(samples), "hit_rate": float(hits / samples), "max_miss_streak": 0.0}
+    if len(rows) < 80:
+        return {"history_window": 16, "decay": 0.10}
+    train_lookback = min(max(60, tune_lookback), max(60, len(rows) - 20))
+    train_end = len(rows) - 20
+    train_start = max(0, train_end - train_lookback)
+    if train_end <= train_start:
+        return {"history_window": 16, "decay": 0.10}
+
+    # anti_streak: prioritize lower max miss streak, then hit rate.
+    # hit_rate: prioritize hit rate, then lower max miss streak.
+    best = {"obj": -999.0, "score": -1.0, "history_window": 16, "decay": 0.10, "max_miss_streak": 999.0}
+    eval_lookback = max(20, train_end - train_start)
+    for history_window in range(12, 29, 2):
+        for decay in (0.05, 0.08, 0.10, 0.12, 0.15, 0.18):
+            report = _recent_zodiac_report(
+                conn,
+                lookback=eval_lookback,
+                history_window=history_window,
+                pool_size=pool_size,
+                decay=decay,
+                special_only=special_only,
+            )
+            if report["samples"] <= 0:
+                continue
+            score = float(report["hit_rate"])
+            miss = float(report["max_miss_streak"])
+            if objective == "anti_streak":
+                obj = score - (miss / max(report["samples"], 1.0)) * 0.70
+            else:
+                obj = score - (miss / max(report["samples"], 1.0)) * 0.25
+
+            if (
+                obj > best["obj"]
+                or (abs(obj - best["obj"]) < 1e-9 and miss < best["max_miss_streak"])
+                or (
+                    abs(obj - best["obj"]) < 1e-9
+                    and abs(miss - best["max_miss_streak"]) < 1e-9
+                    and score > best["score"]
+                )
+            ):
+                best = {
+                    "obj": obj,
+                    "score": score,
+                    "history_window": history_window,
+                    "decay": decay,
+                    "max_miss_streak": miss,
+                }
+    return {"history_window": int(best["history_window"]), "decay": float(best["decay"])}
+
+
+def get_recent_single_zodiac_report(conn, lookback=20, history_window=14, insurance_topk=1, decay=0.10):
+    return _recent_zodiac_report(
+        conn,
+        lookback=lookback,
+        history_window=history_window,
+        pool_size=insurance_topk,
+        decay=decay,
+        special_only=False,
+    )
+
+
+def get_recent_two_zodiac_report(conn, lookback=20, history_window=16, insurance_topk=2, decay=0.10):
+    return _recent_zodiac_report(
+        conn,
+        lookback=lookback,
+        history_window=history_window,
+        pool_size=insurance_topk,
+        decay=decay,
+        special_only=False,
+    )
+
+
+def get_recent_three_zodiac_report(conn, lookback=20, history_window=16, insurance_topk=3, decay=0.08):
+    return _recent_zodiac_report(
+        conn,
+        lookback=lookback,
+        history_window=history_window,
+        pool_size=insurance_topk,
+        decay=decay,
+        special_only=False,
+    )
+
+
+def get_recent_texiao4_report(conn, lookback=20, history_window=16, insurance_topk=4, decay=0.08):
+    return _recent_zodiac_report(
+        conn,
+        lookback=lookback,
+        history_window=history_window,
+        pool_size=insurance_topk,
+        decay=decay,
+        special_only=True,
+    )
 
 
 # ========== 特别号投票 ==========
@@ -2890,34 +2912,61 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
             f"近1中率={hit1:.1f}% 近2中率={hit2:.1f}% 连挂={cold} 当前权重={weight:.1f}%"
         )
 
-    zodiac_report = get_recent_single_zodiac_report(conn, lookback=20, history_window=16)
+    tune_objective = "anti_streak"
+    single_cfg = _tune_zodiac_params(conn, pool_size=1, special_only=False, objective=tune_objective)
+    two_cfg = _tune_zodiac_params(conn, pool_size=2, special_only=False, objective=tune_objective)
+    three_cfg = _tune_zodiac_params(conn, pool_size=3, special_only=False, objective=tune_objective)
+    texiao4_cfg = _tune_zodiac_params(conn, pool_size=4, special_only=False, objective=tune_objective)
+    print(f"\n生肖参数优化目标: {tune_objective}（真实命中率 + 连空惩罚）")
+
+    zodiac_report = get_recent_single_zodiac_report(
+        conn, lookback=20, history_window=single_cfg["history_window"], insurance_topk=1, decay=single_cfg["decay"]
+    )
     print("\n单生肖复盘（最近20期）:")
     print(
         f"  - 最近样本={int(zodiac_report['samples'])}期 "
         f"命中率={zodiac_report['hit_rate'] * 100:.1f}% "
         f"最大连空={int(zodiac_report['max_miss_streak'])}"
     )
-    zodiac_two_report = get_recent_two_zodiac_report(conn, lookback=20, history_window=16)
+    print(f"    最优参数: history_window={single_cfg['history_window']} decay={single_cfg['decay']:.2f}")
+    zodiac_two_report = get_recent_two_zodiac_report(
+        conn, lookback=20, history_window=two_cfg["history_window"], insurance_topk=2, decay=two_cfg["decay"]
+    )
     print("双生肖复盘（最近20期）:")
     print(
         f"  - 最近样本={int(zodiac_two_report['samples'])}期 "
         f"命中率={zodiac_two_report['hit_rate'] * 100:.1f}% "
         f"最大连空={int(zodiac_two_report['max_miss_streak'])}"
     )
-    zodiac_three_report = get_recent_three_zodiac_report(conn, lookback=20, history_window=16, insurance_topk=12)
-    print("三肖复盘（最近20期，保险口径）:")
+    print(f"    最优参数: history_window={two_cfg['history_window']} decay={two_cfg['decay']:.2f}")
+    zodiac_three_report = get_recent_three_zodiac_report(
+        conn,
+        lookback=20,
+        history_window=three_cfg["history_window"],
+        insurance_topk=3,
+        decay=three_cfg["decay"],
+    )
+    print("三肖复盘（最近20期，严格3肖口径）:")
     print(
         f"  - 最近样本={int(zodiac_three_report['samples'])}期 "
         f"命中率={zodiac_three_report['hit_rate'] * 100:.1f}% "
         f"最大连空={int(zodiac_three_report['max_miss_streak'])}"
     )
-    texiao4_report = get_recent_texiao4_report(conn, lookback=20, history_window=16, insurance_topk=12)
-    print("特肖复盘（最近20期，4肖保险口径）:")
+    print(f"    最优参数: history_window={three_cfg['history_window']} decay={three_cfg['decay']:.2f}")
+    texiao4_report = get_recent_texiao4_report(
+        conn,
+        lookback=20,
+        history_window=texiao4_cfg["history_window"],
+        insurance_topk=4,
+        decay=texiao4_cfg["decay"],
+    )
+    print("特肖复盘（最近20期，严格4肖口径，按主号+特别号判定）:")
     print(
         f"  - 最近样本={int(texiao4_report['samples'])}期 "
         f"命中率={texiao4_report['hit_rate'] * 100:.1f}% "
         f"最大连空={int(texiao4_report['max_miss_streak'])}"
     )
+    print(f"    最优参数: history_window={texiao4_cfg['history_window']} decay={texiao4_cfg['decay']:.2f}")
 
     print_final_recommendation(conn)
 
