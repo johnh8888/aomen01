@@ -86,7 +86,7 @@ ZODIAC_MAP = {
 # PushPlus 配置
 PUSHPLUS_TOKEN = ""
 if os.environ.get("PUSHPLUS_TOKEN"):
-PUSHPLUS_TOKEN = os.environ["PUSHPLUS_TOKEN"]
+    PUSHPLUS_TOKEN = os.environ["PUSHPLUS_TOKEN"]
 
 _WEIGHT_PROTECTION_PRINTED: set[str] = set()
 _PROTECTION_PRINT_COUNTER = 0
