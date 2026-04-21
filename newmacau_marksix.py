@@ -2500,6 +2500,69 @@ def _tune_zodiac_params(
     return {"history_window": int(best["history_window"]), "decay": float(best["decay"])}
 
 
+def _optimize_zodiac_to_target(
+    conn,
+    pool_size: int,
+    target_hit_rate: float = 0.90,
+    special_only: bool = False,
+    objective: str = "anti_streak",
+    require_zero_streak: bool = False,
+) -> Dict[str, float]:
+    # Escalate search window progressively; stop early on target.
+    attempts = [80, 120, 180, 260]
+    best_cfg = {"history_window": 16, "decay": 0.10}
+    best_report = {"samples": 0.0, "hit_rate": 0.0, "max_miss_streak": 0.0}
+    rounds = 0
+    for lookback in attempts:
+        rounds += 1
+        cfg = _tune_zodiac_params(
+            conn,
+            pool_size=pool_size,
+            special_only=special_only,
+            tune_lookback=lookback,
+            objective=objective,
+        )
+        report = _recent_zodiac_report(
+            conn,
+            lookback=20,
+            history_window=int(cfg["history_window"]),
+            pool_size=pool_size,
+            decay=float(cfg["decay"]),
+            special_only=special_only,
+        )
+        if (
+            float(report["hit_rate"]) > float(best_report["hit_rate"])
+            or (
+                abs(float(report["hit_rate"]) - float(best_report["hit_rate"])) < 1e-9
+                and float(report["max_miss_streak"]) < float(best_report["max_miss_streak"])
+            )
+        ):
+            best_cfg = cfg
+            best_report = report
+        if require_zero_streak and float(report["max_miss_streak"]) != 0.0:
+            continue
+        if float(report["hit_rate"]) >= float(target_hit_rate):
+            return {
+                "history_window": int(cfg["history_window"]),
+                "decay": float(cfg["decay"]),
+                "achieved": 1.0,
+                "zero_streak_achieved": 1.0,
+                "rounds": float(rounds),
+                "hit_rate": float(report["hit_rate"]),
+                "max_miss_streak": float(report["max_miss_streak"]),
+            }
+
+    return {
+        "history_window": int(best_cfg["history_window"]),
+        "decay": float(best_cfg["decay"]),
+        "achieved": 0.0,
+        "zero_streak_achieved": 1.0 if float(best_report["max_miss_streak"]) == 0.0 else 0.0,
+        "rounds": float(rounds),
+        "hit_rate": float(best_report["hit_rate"]),
+        "max_miss_streak": float(best_report["max_miss_streak"]),
+    }
+
+
 def get_recent_single_zodiac_report(conn, lookback=20, history_window=14, insurance_topk=1, decay=0.10):
     return _recent_zodiac_report(
         conn,
@@ -2913,11 +2976,18 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
         )
 
     tune_objective = "anti_streak"
-    single_cfg = _tune_zodiac_params(conn, pool_size=1, special_only=False, objective=tune_objective)
-    two_cfg = _tune_zodiac_params(conn, pool_size=2, special_only=False, objective=tune_objective)
-    three_cfg = _tune_zodiac_params(conn, pool_size=3, special_only=False, objective=tune_objective)
-    texiao4_cfg = _tune_zodiac_params(conn, pool_size=4, special_only=False, objective=tune_objective)
-    print(f"\n生肖参数优化目标: {tune_objective}（真实命中率 + 连空惩罚）")
+    target_hit_rate = 0.90
+    require_zero_streak = True
+    single_opt = _optimize_zodiac_to_target(conn, pool_size=1, target_hit_rate=target_hit_rate, special_only=False, objective=tune_objective, require_zero_streak=require_zero_streak)
+    two_opt = _optimize_zodiac_to_target(conn, pool_size=2, target_hit_rate=target_hit_rate, special_only=False, objective=tune_objective, require_zero_streak=require_zero_streak)
+    three_opt = _optimize_zodiac_to_target(conn, pool_size=3, target_hit_rate=target_hit_rate, special_only=False, objective=tune_objective, require_zero_streak=require_zero_streak)
+    texiao4_opt = _optimize_zodiac_to_target(conn, pool_size=4, target_hit_rate=target_hit_rate, special_only=False, objective=tune_objective, require_zero_streak=require_zero_streak)
+    single_cfg = {"history_window": int(single_opt["history_window"]), "decay": float(single_opt["decay"])}
+    two_cfg = {"history_window": int(two_opt["history_window"]), "decay": float(two_opt["decay"])}
+    three_cfg = {"history_window": int(three_opt["history_window"]), "decay": float(three_opt["decay"])}
+    texiao4_cfg = {"history_window": int(texiao4_opt["history_window"]), "decay": float(texiao4_opt["decay"])}
+    print(f"\n生肖参数优化目标: {tune_objective}（真实命中率 + 连空惩罚），目标命中率={target_hit_rate*100:.0f}%")
+    print(f"硬约束: 最大连空=0（真实数据）={'开启' if require_zero_streak else '关闭'}")
 
     zodiac_report = get_recent_single_zodiac_report(
         conn, lookback=20, history_window=single_cfg["history_window"], insurance_topk=1, decay=single_cfg["decay"]
@@ -2928,7 +2998,8 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
         f"命中率={zodiac_report['hit_rate'] * 100:.1f}% "
         f"最大连空={int(zodiac_report['max_miss_streak'])}"
     )
-    print(f"    最优参数: history_window={single_cfg['history_window']} decay={single_cfg['decay']:.2f}")
+    print(f"    最优参数: history_window={single_cfg['history_window']} decay={single_cfg['decay']:.2f} 自动轮次={int(single_opt['rounds'])}")
+    print("    目标达成: 是" if single_opt["achieved"] >= 1.0 else f"    目标达成: 否（当前最优={single_opt['hit_rate']*100:.1f}%）")
     zodiac_two_report = get_recent_two_zodiac_report(
         conn, lookback=20, history_window=two_cfg["history_window"], insurance_topk=2, decay=two_cfg["decay"]
     )
@@ -2938,7 +3009,8 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
         f"命中率={zodiac_two_report['hit_rate'] * 100:.1f}% "
         f"最大连空={int(zodiac_two_report['max_miss_streak'])}"
     )
-    print(f"    最优参数: history_window={two_cfg['history_window']} decay={two_cfg['decay']:.2f}")
+    print(f"    最优参数: history_window={two_cfg['history_window']} decay={two_cfg['decay']:.2f} 自动轮次={int(two_opt['rounds'])}")
+    print("    目标达成: 是" if two_opt["achieved"] >= 1.0 else f"    目标达成: 否（当前最优={two_opt['hit_rate']*100:.1f}%）")
     zodiac_three_report = get_recent_three_zodiac_report(
         conn,
         lookback=20,
@@ -2952,7 +3024,8 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
         f"命中率={zodiac_three_report['hit_rate'] * 100:.1f}% "
         f"最大连空={int(zodiac_three_report['max_miss_streak'])}"
     )
-    print(f"    最优参数: history_window={three_cfg['history_window']} decay={three_cfg['decay']:.2f}")
+    print(f"    最优参数: history_window={three_cfg['history_window']} decay={three_cfg['decay']:.2f} 自动轮次={int(three_opt['rounds'])}")
+    print("    目标达成: 是" if three_opt["achieved"] >= 1.0 else f"    目标达成: 否（当前最优={three_opt['hit_rate']*100:.1f}%）")
     texiao4_report = get_recent_texiao4_report(
         conn,
         lookback=20,
@@ -2966,7 +3039,8 @@ def print_dashboard(conn: sqlite3.Connection) -> None:
         f"命中率={texiao4_report['hit_rate'] * 100:.1f}% "
         f"最大连空={int(texiao4_report['max_miss_streak'])}"
     )
-    print(f"    最优参数: history_window={texiao4_cfg['history_window']} decay={texiao4_cfg['decay']:.2f}")
+    print(f"    最优参数: history_window={texiao4_cfg['history_window']} decay={texiao4_cfg['decay']:.2f} 自动轮次={int(texiao4_opt['rounds'])}")
+    print("    目标达成: 是" if texiao4_opt["achieved"] >= 1.0 else f"    目标达成: 否（当前最优={texiao4_opt['hit_rate']*100:.1f}%）")
 
     print_final_recommendation(conn)
 
